@@ -16,8 +16,8 @@ from contextlib import closing
 import pytz
 from aiohttp import web
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from aiogram.filters import CommandStart
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -151,6 +151,18 @@ async def start(m: Message):
         "Открыть календарь — кнопкой ниже или через меню.",
         reply_markup=kb)
 
+@dp.message(Command("backup"))
+async def backup(m: Message):
+    if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
+        return
+    try:
+        await m.answer_document(
+            FSInputFile(DB_PATH, filename="ljubicasto.db"),
+            caption=f"Бэкап базы — {datetime.now(tz).strftime('%d.%m.%Y %H:%M')}"
+        )
+    except Exception as e:
+        await m.answer(f"Не удалось отправить файл: {e}")
+
 # ---------------------- morning notifications ----------------------
 async def morning():
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -177,6 +189,10 @@ WEBHOOK_PATH = "/webhook"
 async def on_startup(app):
     init_db()
     await bot.set_webhook(PUBLIC_URL + WEBHOOK_PATH, drop_pending_updates=True)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Открыть расписание"),
+        BotCommand(command="backup", description="Скачать бэкап базы"),
+    ])
     sched = AsyncIOScheduler(timezone=tz)
     sched.add_job(morning, "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
     sched.start()
