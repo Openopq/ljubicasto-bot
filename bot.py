@@ -48,9 +48,19 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS lessons(
             id TEXT PRIMARY KEY, date TEXT, time TEXT,
             name TEXT, phone TEXT, tg TEXT, price TEXT, level TEXT, about TEXT,
-            paid INTEGER DEFAULT 0, groupId TEXT)""")
+            paid INTEGER DEFAULT 0, groupId TEXT,
+            contacts TEXT, note TEXT, trial INTEGER DEFAULT 0, studentId TEXT, color TEXT)""")
+        # миграция: добавить недостающие колонки в существующую базу
+        for col,decl in [("contacts","TEXT"),("note","TEXT"),("trial","INTEGER DEFAULT 0"),
+                         ("studentId","TEXT"),("color","TEXT")]:
+            try: c.execute(f"ALTER TABLE lessons ADD COLUMN {col} {decl}")
+            except Exception: pass
         c.execute("""CREATE TABLE IF NOT EXISTS users(
             chat_id INTEGER PRIMARY KEY, notify INTEGER DEFAULT 1)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS students(
+            id TEXT PRIMARY KEY, name TEXT, phone TEXT, contacts TEXT,
+            price TEXT, duration TEXT, level TEXT, about TEXT,
+            color TEXT, trialUsed INTEGER DEFAULT 0, created INTEGER)""")
         c.commit()
 
 def day_lessons(date):
@@ -63,11 +73,13 @@ def replace_day(date, lessons):
         c.execute("DELETE FROM lessons WHERE date=?", (date,))
         for L in lessons:
             c.execute("""INSERT OR REPLACE INTO lessons
-                (id,date,time,name,phone,tg,price,level,about,paid,groupId)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (id,date,time,name,phone,tg,price,level,about,paid,groupId,contacts,note,trial,studentId,color)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (L.get("id"), date, L.get("time",""), L.get("name",""), L.get("phone",""),
                  L.get("tg",""), L.get("price",""), L.get("level",""), L.get("about",""),
-                 1 if L.get("paid") else 0, L.get("groupId")))
+                 1 if L.get("paid") else 0, L.get("groupId"),
+                 L.get("contacts",""), L.get("note",""), 1 if L.get("trial") else 0,
+                 L.get("studentId"), L.get("color","")))
         c.commit()
 
 def all_day_keys():
@@ -78,6 +90,26 @@ def all_day_keys():
             y, m, d = r["date"].split("-")
             keys.append(f"d_{y}_{m}_{d}")
         return keys
+
+def list_students():
+    with closing(db()) as c:
+        rows = c.execute("SELECT * FROM students ORDER BY created").fetchall()
+        return [dict(r) for r in rows]
+
+def save_student(s):
+    with closing(db()) as c:
+        c.execute("""INSERT OR REPLACE INTO students
+            (id,name,phone,contacts,price,duration,level,about,color,trialUsed,created)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (s.get("id"), s.get("name",""), s.get("phone",""), s.get("contacts",""),
+             s.get("price",""), s.get("duration",""), s.get("level",""), s.get("about",""),
+             s.get("color",""), 1 if s.get("trialUsed") else 0, s.get("created") or 0))
+        c.commit()
+
+def delete_student(sid):
+    with closing(db()) as c:
+        c.execute("DELETE FROM students WHERE id=?", (sid,))
+        c.commit()
 
 def register_user(chat_id):
     with closing(db()) as c:
@@ -132,6 +164,25 @@ async def api_keys(request):
     if check_init(request) is None:
         return web.json_response({"error": "auth"}, status=403)
     return web.json_response({"keys": all_day_keys()})
+
+async def api_students(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    return web.json_response({"students": list_students()})
+
+async def api_save_student(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    save_student(body)
+    return web.json_response({"ok": True})
+
+async def api_delete_student(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    delete_student(body.get("id"))
+    return web.json_response({"ok": True})
 
 async def health(request):
     return web.Response(text="Ljubičasto OK")
@@ -205,6 +256,9 @@ def main():
     app.router.add_get("/api/day", api_day)
     app.router.add_post("/api/day", api_save_day)
     app.router.add_get("/api/keys", api_keys)
+    app.router.add_get("/api/students", api_students)
+    app.router.add_post("/api/students", api_save_student)
+    app.router.add_post("/api/students/delete", api_delete_student)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
