@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=4"
 ALLOWED_IDS = [7653945813, 6571313515]
 NOTIFY_HOUR = 8
 NOTIFY_MIN  = 0
@@ -223,9 +223,10 @@ async def morning():
     lines = [f"• {L['time']} — {L['name'] or 'занятие'}"
              + (f" ({L['price']} ₽)" if L.get("price") else "") for L in lessons]
     text = f"Доброе утро! Сегодня занятий: {len(lessons)}\n\n" + "\n".join(lines)
+    sep = "&" if "?" in MINIAPP_URL else "?"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Узнать подробнее",
-                             web_app=WebAppInfo(url=f"{MINIAPP_URL}?d={today}"))
+                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}"))
     ]])
     for chat_id in notify_users():
         try:
