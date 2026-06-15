@@ -133,6 +133,16 @@ def set_history_mode(on: bool):
         c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("history_mode", "1" if on else "0"))
         c.commit()
 
+def get_setting(k, default=""):
+    with closing(db()) as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        return row["value"] if row else default
+
+def set_setting(k, v):
+    with closing(db()) as c:
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, str(v)))
+        c.commit()
+
 
 # ---------------------- auth ----------------------
 def check_init(request):
@@ -238,6 +248,34 @@ async def cmd_history(m: Message):
     status = "включён" if not current else "выключён"
     await m.answer(f"Режим истории {status}. Теперь можно назначать уроки в прошлом.")
 
+# ---------------------- hour-before reminder ----------------------
+async def hour_reminder():
+    now = datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    lessons = day_lessons(today)
+    for L in lessons:
+        t = L.get("time", "")
+        if not t or ":" not in t:
+            continue
+        try:
+            hh, mm = map(int, t.split(":")[:2])
+        except Exception:
+            continue
+        start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        diff = (start - now).total_seconds() / 60.0
+        # окно 55–65 минут до начала, чтобы попасть один раз при проверке раз в 10 мин
+        if 55 <= diff <= 65:
+            marker = f"reminded_{L['id']}"
+            if get_setting(marker, "0") == "1":
+                continue
+            txt = f"⏰ Через час урок — {L.get('name') or 'занятие'} в {t}."
+            for chat_id in notify_users():
+                try:
+                    await bot.send_message(chat_id, txt)
+                except Exception as e:
+                    logging.warning("reminder fail %s: %s", chat_id, e)
+            set_setting(marker, "1")
+
 # ---------------------- morning notifications ----------------------
 async def morning():
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -278,6 +316,7 @@ async def on_startup(app):
     ])
     sched = AsyncIOScheduler(timezone=tz)
     sched.add_job(morning, "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
+    sched.add_job(hour_reminder, "cron", minute="*/10")
     sched.start()
     logging.info("started, webhook -> %s", PUBLIC_URL + WEBHOOK_PATH)
 
