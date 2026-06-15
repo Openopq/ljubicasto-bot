@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=4"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=5"
 ALLOWED_IDS = [7653945813, 6571313515]
 NOTIFY_HOUR = 8
 NOTIFY_MIN  = 0
@@ -52,15 +52,17 @@ def init_db():
             contacts TEXT, note TEXT, trial INTEGER DEFAULT 0, studentId TEXT, color TEXT)""")
         # миграция: добавить недостающие колонки в существующую базу
         for col,decl in [("contacts","TEXT"),("note","TEXT"),("trial","INTEGER DEFAULT 0"),
-                         ("studentId","TEXT"),("color","TEXT")]:
+                         ("studentId","TEXT"),("color","TEXT"),("archived","INTEGER DEFAULT 0")]:
             try: c.execute(f"ALTER TABLE lessons ADD COLUMN {col} {decl}")
             except Exception: pass
         c.execute("""CREATE TABLE IF NOT EXISTS users(
             chat_id INTEGER PRIMARY KEY, notify INTEGER DEFAULT 1)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS students(
             id TEXT PRIMARY KEY, name TEXT, phone TEXT, contacts TEXT,
             price TEXT, duration TEXT, level TEXT, about TEXT,
-            color TEXT, trialUsed INTEGER DEFAULT 0, created INTEGER)""")
+            color TEXT, trialUsed INTEGER DEFAULT 0, created INTEGER, archived INTEGER DEFAULT 0)""")
         c.commit()
 
 def day_lessons(date):
@@ -99,16 +101,17 @@ def list_students():
 def save_student(s):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO students
-            (id,name,phone,contacts,price,duration,level,about,color,trialUsed,created)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (id,name,phone,contacts,price,duration,level,about,color,trialUsed,created,archived)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (s.get("id"), s.get("name",""), s.get("phone",""), s.get("contacts",""),
              s.get("price",""), s.get("duration",""), s.get("level",""), s.get("about",""),
-             s.get("color",""), 1 if s.get("trialUsed") else 0, s.get("created") or 0))
+             s.get("color",""), 1 if s.get("trialUsed") else 0, s.get("created") or 0,
+             1 if s.get("archived") else 0))
         c.commit()
 
 def delete_student(sid):
     with closing(db()) as c:
-        c.execute("DELETE FROM students WHERE id=?", (sid,))
+        c.execute("UPDATE students SET archived=1 WHERE id=?", (sid,))
         c.commit()
 
 def register_user(chat_id):
@@ -119,6 +122,17 @@ def register_user(chat_id):
 def notify_users():
     with closing(db()) as c:
         return [r["chat_id"] for r in c.execute("SELECT chat_id FROM users WHERE notify=1").fetchall()]
+
+def get_history_mode():
+    with closing(db()) as c:
+        row = c.execute("SELECT value FROM settings WHERE key='history_mode'").fetchone()
+        return row and row["value"] == "1"
+
+def set_history_mode(on: bool):
+    with closing(db()) as c:
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("history_mode", "1" if on else "0"))
+        c.commit()
+
 
 # ---------------------- auth ----------------------
 def check_init(request):
@@ -214,6 +228,16 @@ async def backup(m: Message):
     except Exception as e:
         await m.answer(f"Не удалось отправить файл: {e}")
 
+
+@dp.message(Command("history"))
+async def cmd_history(m: Message):
+    if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
+        return
+    current = get_history_mode()
+    set_history_mode(not current)
+    status = "включён" if not current else "выключён"
+    await m.answer(f"Режим истории {status}. Теперь можно назначать уроки в прошлом.")
+
 # ---------------------- morning notifications ----------------------
 async def morning():
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -234,6 +258,12 @@ async def morning():
         except Exception as e:
             logging.warning("notify fail %s: %s", chat_id, e)
 
+
+async def api_history(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    return web.json_response({"history": get_history_mode()})
+
 # ---------------------- startup ----------------------
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
@@ -244,6 +274,7 @@ async def on_startup(app):
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть расписание"),
         BotCommand(command="backup", description="Скачать бэкап базы"),
+        BotCommand(command="history", description="Включить/выключить режим истории"),
     ])
     sched = AsyncIOScheduler(timezone=tz)
     sched.add_job(morning, "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
@@ -260,6 +291,7 @@ def main():
     app.router.add_get("/api/students", api_students)
     app.router.add_post("/api/students", api_save_student)
     app.router.add_post("/api/students/delete", api_delete_student)
+    app.router.add_get("/api/history", api_history)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
