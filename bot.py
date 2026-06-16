@@ -148,6 +148,11 @@ def delete_student(sid):
         c.execute("UPDATE students SET archived=1 WHERE id=?", (sid,))
         c.commit()
 
+def delete_student_forever(sid):
+    with closing(db()) as c:
+        c.execute("DELETE FROM students WHERE id=?", (sid,))
+        c.commit()
+
 def register_user(chat_id):
     with closing(db()) as c:
         c.execute("INSERT OR IGNORE INTO users(chat_id,notify) VALUES(?,1)", (chat_id,))
@@ -280,6 +285,13 @@ async def api_delete_student(request):
         return web.json_response({"error": "auth"}, status=403)
     body = await request.json()
     delete_student(body.get("id"))
+    return web.json_response({"ok": True})
+
+async def api_delete_student_forever(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    delete_student_forever(body.get("id"))
     return web.json_response({"ok": True})
 
 async def api_history(request):
@@ -457,7 +469,8 @@ def main():
     app.router.add_get("/api/keys",              api_keys)
     app.router.add_get("/api/students",          api_students)
     app.router.add_post("/api/students",         api_save_student)
-    app.router.add_post("/api/students/delete",  api_delete_student)
+    app.router.add_post("/api/students/delete",         api_delete_student)
+    app.router.add_post("/api/students/delete-forever",  api_delete_student_forever)
     app.router.add_get("/api/history",           api_history)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
