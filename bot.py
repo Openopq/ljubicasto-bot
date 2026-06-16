@@ -63,6 +63,9 @@ def init_db():
             id TEXT PRIMARY KEY, name TEXT, phone TEXT, contacts TEXT,
             price TEXT, duration TEXT, level TEXT, about TEXT,
             color TEXT, trialUsed INTEGER DEFAULT 0, created INTEGER, archived INTEGER DEFAULT 0)""")
+        # миграция: если таблица students создавалась раньше, без archived
+        try: c.execute("ALTER TABLE students ADD COLUMN archived INTEGER DEFAULT 0")
+        except Exception: pass
         c.commit()
 
 def day_lessons(date):
@@ -198,7 +201,11 @@ async def api_save_student(request):
     if check_init(request) is None:
         return web.json_response({"error": "auth"}, status=403)
     body = await request.json()
-    save_student(body)
+    try:
+        save_student(body)
+    except Exception as e:
+        logging.exception("save_student failed")
+        return web.json_response({"error": str(e)}, status=500)
     return web.json_response({"ok": True})
 
 async def api_delete_student(request):
