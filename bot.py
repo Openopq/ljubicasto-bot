@@ -13,8 +13,8 @@ from contextlib import closing
 
 import pytz
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
+from aiogram import Bot, Dispatcher
+from aiogram.types import (Message, InlineKeyboardMarkup,
                            InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand)
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.web_app import safe_parse_webapp_init_data
@@ -291,15 +291,15 @@ async def health(request):
     return web.Response(text="Ljubičasto OK")
 
 # ---------------------- bot handlers ----------------------
-def dev_kb():
-    """Инлайн-клавиатура управления для разработчика."""
-    history_label = "📕 Выкл. историю" if get_history_mode() else "📖 Вкл. историю"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=history_label,   callback_data="dev:history"),
-         InlineKeyboardButton(text="💾 Бэкап",       callback_data="dev:backup")],
-        [InlineKeyboardButton(text="📊 Статус",      callback_data="dev:status"),
-         InlineKeyboardButton(text="🔄 Вебхук",      callback_data="dev:webhook")],
-    ])
+def dev_menu_text():
+    hist = "включён 📖" if get_history_mode() else "выключён 📕"
+    return (
+        f"\n\n🛠 Панель разработчика:\n"
+        f"/history — режим истории ({hist})\n"
+        f"/backup — скачать бэкап базы\n"
+        f"/status — статистика и состояние базы\n"
+        f"/resetwebhook — переустановить вебхук"
+    )
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -313,9 +313,8 @@ async def start(m: Message):
     ]])
     if m.from_user.id == DEV_ID:
         await m.answer(
-            "Љубичица 🌸 — запущена.\n\n"
-            "Панель управления:",
-            reply_markup=dev_kb())
+            "Љубичица 🌸 — запущена." + dev_menu_text(),
+            reply_markup=kb)
     else:
         await m.answer(
             "Привет, Миляна! Я Љубичица 🌸\n"
@@ -323,50 +322,29 @@ async def start(m: Message):
             "Открыть календарь — кнопкой ниже или через меню.",
             reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("dev:"))
-async def dev_callback(cb: CallbackQuery):
-    if cb.from_user.id != DEV_ID:
-        await cb.answer("Нет доступа.", show_alert=True)
+@dp.message(Command("status"))
+async def cmd_status(m: Message):
+    if m.from_user.id != DEV_ID:
         return
-    action = cb.data.split(":")[1]
+    students, lessons, markers, size_kb = db_stats()
+    hist = "включён 📖" if get_history_mode() else "выключён 📕"
+    await m.answer(
+        f"📊 Статус Ljubičasto\n\n"
+        f"👥 Учеников: {students}\n"
+        f"📅 Занятий в базе: {lessons}\n"
+        f"🔔 Маркеров напоминаний: {markers}\n"
+        f"💾 Размер базы: {size_kb} КБ\n"
+        f"📖 Режим истории: {hist}")
 
-    if action == "history":
-        cur = get_history_mode()
-        set_history_mode(not cur)
-        status = "включён 📖" if not cur else "выключён 📕"
-        await cb.answer(f"Режим истории {status}", show_alert=False)
-        # обновляем кнопку
-        await cb.message.edit_reply_markup(reply_markup=dev_kb())
-
-    elif action == "backup":
-        await cb.answer("Отправляю бэкап…")
-        try:
-            await bot.send_document(
-                DEV_ID,
-                FSInputFile(DB_PATH, filename="ljubicasto.db"),
-                caption=f"💾 Бэкап — {datetime.now(tz).strftime('%d.%m.%Y %H:%M')}")
-        except Exception as e:
-            await bot.send_message(DEV_ID, f"Ошибка бэкапа: {e}")
-
-    elif action == "status":
-        students, lessons, markers, size_kb = db_stats()
-        hist = "вкл 📖" if get_history_mode() else "выкл 📕"
-        text = (f"📊 Статус Ljubičasto\n\n"
-                f"👥 Учеников: {students}\n"
-                f"📅 Занятий в базе: {lessons}\n"
-                f"🔔 Маркеров напоминаний: {markers}\n"
-                f"💾 Размер базы: {size_kb} КБ\n"
-                f"📖 Режим истории: {hist}")
-        await cb.answer()
-        await bot.send_message(DEV_ID, text)
-
-    elif action == "webhook":
-        await cb.answer("Обновляю вебхук…")
-        try:
-            await bot.set_webhook(PUBLIC_URL + WEBHOOK_PATH, drop_pending_updates=False)
-            await bot.send_message(DEV_ID, "✅ Вебхук переустановлен.")
-        except Exception as e:
-            await bot.send_message(DEV_ID, f"Ошибка вебхука: {e}")
+@dp.message(Command("resetwebhook"))
+async def cmd_resetwebhook(m: Message):
+    if m.from_user.id != DEV_ID:
+        return
+    try:
+        await bot.set_webhook(PUBLIC_URL + WEBHOOK_PATH, drop_pending_updates=False)
+        await m.answer("✅ Вебхук переустановлен.")
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
 
 @dp.message(Command("backup"))
 async def cmd_backup(m: Message):
@@ -455,9 +433,11 @@ async def on_startup(app):
     init_db()
     await bot.set_webhook(PUBLIC_URL + WEBHOOK_PATH, drop_pending_updates=True)
     await bot.set_my_commands([
-        BotCommand(command="start",   description="Открыть расписание / панель управления"),
-        BotCommand(command="backup",  description="Скачать бэкап базы"),
-        BotCommand(command="history", description="Включить/выключить режим истории"),
+        BotCommand(command="start",        description="Открыть расписание / панель управления"),
+        BotCommand(command="backup",       description="Скачать бэкап базы"),
+        BotCommand(command="history",      description="Включить/выключить режим истории"),
+        BotCommand(command="status",       description="Статистика базы"),
+        BotCommand(command="resetwebhook", description="Переустановить вебхук"),
     ])
     sched = AsyncIOScheduler(timezone=tz)
     sched.add_job(morning,       "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
