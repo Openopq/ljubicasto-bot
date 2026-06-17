@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=11"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=16"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -67,6 +67,15 @@ def init_db():
             created INTEGER, archived INTEGER DEFAULT 0)""")
         try: c.execute("ALTER TABLE students ADD COLUMN archived INTEGER DEFAULT 0")
         except Exception: pass
+        # ---- конструктор заданий ----
+        c.execute("""CREATE TABLE IF NOT EXISTS task_levels(
+            id TEXT PRIMARY KEY, name TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS task_groups(
+            id TEXT PRIMARY KEY, name TEXT, level_id TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tasks(
+            id TEXT PRIMARY KEY, type TEXT, word TEXT, translation TEXT,
+            choices TEXT, correct INTEGER DEFAULT 0,
+            audio_file_id TEXT, group_id TEXT, level_id TEXT, created INTEGER)""")
         c.commit()
 
 # ---------------------- DB helpers ----------------------
@@ -151,6 +160,90 @@ def delete_student(sid):
 def delete_student_forever(sid):
     with closing(db()) as c:
         c.execute("DELETE FROM students WHERE id=?", (sid,))
+        c.commit()
+
+# ---- конструктор заданий ----
+def list_levels():
+    with closing(db()) as c:
+        return [dict(r) for r in c.execute("SELECT * FROM task_levels ORDER BY sort,created").fetchall()]
+
+def save_level(lv):
+    with closing(db()) as c:
+        c.execute("INSERT OR REPLACE INTO task_levels(id,name,sort,created) VALUES(?,?,?,?)",
+                  (lv["id"], lv["name"], lv.get("sort",0), lv.get("created",0)))
+        c.commit()
+
+def delete_level(lid):
+    with closing(db()) as c:
+        c.execute("DELETE FROM task_levels WHERE id=?", (lid,))
+        # группы и задания этого уровня тоже удаляем
+        gids=[r["id"] for r in c.execute("SELECT id FROM task_groups WHERE level_id=?", (lid,)).fetchall()]
+        c.execute("DELETE FROM task_groups WHERE level_id=?", (lid,))
+        for gid in gids:
+            c.execute("DELETE FROM tasks WHERE group_id=?", (gid,))
+        c.execute("DELETE FROM tasks WHERE level_id=? AND group_id IS NULL", (lid,))
+        c.commit()
+
+def list_groups(level_id=None):
+    with closing(db()) as c:
+        if level_id:
+            rows=c.execute("SELECT * FROM task_groups WHERE level_id=? ORDER BY sort,created",(level_id,)).fetchall()
+        else:
+            rows=c.execute("SELECT * FROM task_groups ORDER BY sort,created").fetchall()
+        return [dict(r) for r in rows]
+
+def save_group(g):
+    with closing(db()) as c:
+        c.execute("INSERT OR REPLACE INTO task_groups(id,name,level_id,sort,created) VALUES(?,?,?,?,?)",
+                  (g["id"], g["name"], g.get("level_id",""), g.get("sort",0), g.get("created",0)))
+        c.commit()
+
+def count_tasks_in_group(gid):
+    with closing(db()) as c:
+        return c.execute("SELECT COUNT(*) FROM tasks WHERE group_id=?", (gid,)).fetchone()[0]
+
+def delete_group(gid, force=False):
+    with closing(db()) as c:
+        count = c.execute("SELECT COUNT(*) FROM tasks WHERE group_id=?", (gid,)).fetchone()[0]
+        if count > 0 and not force:
+            return {"ok": False, "count": count}
+        c.execute("DELETE FROM tasks WHERE group_id=?", (gid,))
+        c.execute("DELETE FROM task_groups WHERE id=?", (gid,))
+        c.commit()
+        return {"ok": True}
+
+def list_tasks(group_id=None, level_id=None):
+    with closing(db()) as c:
+        if group_id:
+            rows=c.execute("SELECT * FROM tasks WHERE group_id=? ORDER BY created",(group_id,)).fetchall()
+        elif level_id:
+            rows=c.execute("SELECT * FROM tasks WHERE level_id=? ORDER BY created",(level_id,)).fetchall()
+        else:
+            rows=c.execute("SELECT * FROM tasks ORDER BY created").fetchall()
+        return [dict(r) for r in rows]
+
+def save_task(t):
+    with closing(db()) as c:
+        c.execute("""INSERT OR REPLACE INTO tasks
+            (id,type,word,translation,choices,correct,audio_file_id,group_id,level_id,created)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (t["id"], t.get("type","choice"), t.get("word",""), t.get("translation",""),
+             t.get("choices",""), t.get("correct",0), t.get("audio_file_id",""),
+             t.get("group_id",""), t.get("level_id",""), t.get("created",0)))
+        c.commit()
+
+def move_task_group(task_id, new_group_id):
+    with closing(db()) as c:
+        # level_id берём из новой группы
+        row=c.execute("SELECT level_id FROM task_groups WHERE id=?", (new_group_id,)).fetchone()
+        new_level=row["level_id"] if row else ""
+        c.execute("UPDATE tasks SET group_id=?, level_id=? WHERE id=?",
+                  (new_group_id, new_level, task_id))
+        c.commit()
+
+def delete_task(tid):
+    with closing(db()) as c:
+        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
         c.commit()
 
 def register_user(chat_id):
@@ -299,6 +392,60 @@ async def api_history(request):
         return web.json_response({"error": "auth"}, status=403)
     return web.json_response({"history": get_history_mode()})
 
+# ---- конструктор заданий ----
+async def api_levels(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    if request.method=="POST":
+        save_level(await request.json()); return web.json_response({"ok":True})
+    return web.json_response({"levels": list_levels()})
+
+async def api_delete_level(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    body=await request.json(); delete_level(body["id"])
+    return web.json_response({"ok":True})
+
+async def api_groups(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    if request.method=="POST":
+        save_group(await request.json()); return web.json_response({"ok":True})
+    level_id=request.query.get("level_id")
+    return web.json_response({"groups": list_groups(level_id)})
+
+async def api_delete_group(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    body=await request.json()
+    result=delete_group(body["id"], force=body.get("force",False))
+    return web.json_response(result)
+
+async def api_tasks(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    if request.method=="POST":
+        save_task(await request.json()); return web.json_response({"ok":True})
+    group_id=request.query.get("group_id"); level_id=request.query.get("level_id")
+    return web.json_response({"tasks": list_tasks(group_id, level_id)})
+
+async def api_delete_task(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    body=await request.json(); delete_task(body["id"])
+    return web.json_response({"ok":True})
+
+async def api_move_task(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    body=await request.json(); move_task_group(body["task_id"], body["group_id"])
+    return web.json_response({"ok":True})
+
+async def api_audio(request):
+    """Возвращает прямую ссылку на аудио-файл по file_id."""
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    file_id=request.query.get("file_id","")
+    if not file_id: return web.json_response({"error":"no file_id"},status=400)
+    try:
+        f=await bot.get_file(file_id)
+        url=f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+        return web.json_response({"url":url})
+    except Exception as e:
+        return web.json_response({"error":str(e)},status=500)
+
 async def health(request):
     return web.Response(text="Ljubičasto OK")
 
@@ -310,7 +457,8 @@ def dev_menu_text():
         f"/history — режим истории ({hist})\n"
         f"/backup — скачать бэкап базы\n"
         f"/status — статистика и состояние базы\n"
-        f"/resetwebhook — переустановить вебхук"
+        f"/resetwebhook — переустановить вебхук\n"
+        f"/tasks — конструктор заданий"
     )
 
 @dp.message(CommandStart())
@@ -319,20 +467,38 @@ async def start(m: Message):
         await m.answer("Этот календарь только для преподавателя.")
         return
     register_user(m.chat.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Открыть расписание",
-                             web_app=WebAppInfo(url=MINIAPP_URL))
-    ]])
     if m.from_user.id == DEV_ID:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📅 Расписание",
+                                 web_app=WebAppInfo(url=MINIAPP_URL)),
+            InlineKeyboardButton(text="📚 Задания",
+                                 web_app=WebAppInfo(url=TASKS_URL)),
+        ]])
         await m.answer(
             "Љубичица 🌸 — запущена." + dev_menu_text(),
             reply_markup=kb)
     else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📅 Открыть расписание",
+                                 web_app=WebAppInfo(url=MINIAPP_URL)),
+            InlineKeyboardButton(text="📚 Задания",
+                                 web_app=WebAppInfo(url=TASKS_URL)),
+        ]])
         await m.answer(
             "Привет, Миляна! Я Љубичица 🌸\n"
             "Буду присылать расписание по утрам. "
-            "Открыть календарь — кнопкой ниже или через меню.",
+            "Открыть календарь или конструктор заданий — кнопками ниже.",
             reply_markup=kb)
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(m: Message):
+    if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📚 Открыть конструктор",
+                             web_app=WebAppInfo(url=TASKS_URL))
+    ]])
+    await m.answer("Конструктор заданий:", reply_markup=kb)
 
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
@@ -357,6 +523,19 @@ async def cmd_resetwebhook(m: Message):
         await m.answer("✅ Вебхук переустановлен.")
     except Exception as e:
         await m.answer(f"Ошибка: {e}")
+
+@dp.message(lambda m: m.voice or m.audio)
+async def handle_audio(m: Message):
+    """Принимает голосовое или аудио и возвращает file_id для конструктора заданий."""
+    if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
+        return
+    file_id = m.voice.file_id if m.voice else m.audio.file_id
+    await m.answer(
+        f"✅ Аудио получено!\n\n"
+        f"<code>{file_id}</code>\n\n"
+        f"Скопируй этот file_id и вставь в поле «Аудио файл» в конструкторе заданий.",
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("backup"))
 async def cmd_backup(m: Message):
@@ -441,11 +620,14 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html"
+
 async def on_startup(app):
     init_db()
     await bot.set_webhook(PUBLIC_URL + WEBHOOK_PATH, drop_pending_updates=True)
     await bot.set_my_commands([
         BotCommand(command="start",        description="Открыть расписание / панель управления"),
+        BotCommand(command="tasks",        description="Конструктор заданий"),
         BotCommand(command="backup",       description="Скачать бэкап базы"),
         BotCommand(command="history",      description="Включить/выключить режим истории"),
         BotCommand(command="status",       description="Статистика базы"),
@@ -455,7 +637,7 @@ async def on_startup(app):
     sched.add_job(morning,       "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
     sched.add_job(hour_reminder, "cron", minute="*/10")
     sched.add_job(auto_backup,   "interval", days=3)
-    sched.add_job(clean_old_markers, "cron", hour=3, minute=0)  # чистка маркеров в 3 ночи
+    sched.add_job(clean_old_markers, "cron", hour=3, minute=0)
     sched.start()
     logging.info("started, webhook -> %s", PUBLIC_URL + WEBHOOK_PATH)
 
@@ -472,6 +654,18 @@ def main():
     app.router.add_post("/api/students/delete",         api_delete_student)
     app.router.add_post("/api/students/delete-forever",  api_delete_student_forever)
     app.router.add_get("/api/history",           api_history)
+    # конструктор заданий
+    app.router.add_get("/api/levels",            api_levels)
+    app.router.add_post("/api/levels",           api_levels)
+    app.router.add_post("/api/levels/delete",    api_delete_level)
+    app.router.add_get("/api/groups",            api_groups)
+    app.router.add_post("/api/groups",           api_groups)
+    app.router.add_post("/api/groups/delete",    api_delete_group)
+    app.router.add_get("/api/tasks",             api_tasks)
+    app.router.add_post("/api/tasks",            api_tasks)
+    app.router.add_post("/api/tasks/delete",     api_delete_task)
+    app.router.add_post("/api/tasks/move",       api_move_task)
+    app.router.add_get("/api/audio",             api_audio)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
