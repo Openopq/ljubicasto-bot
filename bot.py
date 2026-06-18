@@ -392,6 +392,34 @@ async def api_history(request):
         return web.json_response({"error": "auth"}, status=403)
     return web.json_response({"history": get_history_mode()})
 
+async def api_history_set(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    set_history_mode(bool(body.get("on", False)))
+    return web.json_response({"ok": True, "history": get_history_mode()})
+
+async def api_notify(request):
+    """Возвращает персональные настройки уведомлений."""
+    uid = check_init(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    hour = get_setting(f"notify_hour_{uid}", "1") == "1"
+    morning = get_setting(f"notify_morning_{uid}", "1") == "1"
+    evening = get_setting(f"notify_evening_{uid}", "0") == "1"
+    return web.json_response({"hour_reminder": hour, "morning": morning, "evening": evening})
+
+async def api_notify_set(request):
+    """Сохраняет персональные настройки уведомлений."""
+    uid = check_init(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    set_setting(f"notify_hour_{uid}", "1" if body.get("hour_reminder", True) else "0")
+    set_setting(f"notify_morning_{uid}", "1" if body.get("morning", True) else "0")
+    set_setting(f"notify_evening_{uid}", "1" if body.get("evening", False) else "0")
+    return web.json_response({"ok": True})
+
 # ---- конструктор заданий ----
 async def api_levels(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
@@ -579,6 +607,8 @@ async def hour_reminder():
                 continue
             txt = f"⏰ Через час урок — {L.get('name') or 'занятие'} в {t}."
             for chat_id in notify_users():
+                if get_setting(f"notify_hour_{chat_id}", "1") != "1":
+                    continue
                 try:
                     await bot.send_message(chat_id, txt)
                 except Exception as e:
@@ -601,10 +631,35 @@ async def morning():
                              web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}"))
     ]])
     for chat_id in notify_users():
+        if get_setting(f"notify_morning_{chat_id}", "1") != "1":
+            continue
         try:
             await bot.send_message(chat_id, text, reply_markup=kb)
         except Exception as e:
             logging.warning("notify fail %s: %s", chat_id, e)
+
+async def evening():
+    """Уведомление в 20:00 о расписании на завтра."""
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).strftime("%Y-%m-%d")
+    lessons = day_lessons(tomorrow)
+    if not lessons:
+        return
+    lines = [f"• {L['time']} — {L['name'] or 'занятие'}"
+             + (f" ({L['price']} ₽)" if L.get("price") else "")
+             for L in lessons]
+    text = f"Завтра занятий: {len(lessons)}\n\n" + "\n".join(lines)
+    sep  = "&" if "?" in MINIAPP_URL else "?"
+    kb   = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть расписание",
+                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={tomorrow}"))
+    ]])
+    for chat_id in notify_users():
+        if get_setting(f"notify_evening_{chat_id}", "0") != "1":
+            continue
+        try:
+            await bot.send_message(chat_id, text, reply_markup=kb)
+        except Exception as e:
+            logging.warning("evening notify fail %s: %s", chat_id, e)
 
 # ---------------------- auto backup (раз в 3 дня) ----------------------
 async def auto_backup():
@@ -635,8 +690,9 @@ async def on_startup(app):
     ])
     sched = AsyncIOScheduler(timezone=tz)
     sched.add_job(morning,       "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
+    sched.add_job(evening,       "cron", hour=20, minute=0)
     sched.add_job(hour_reminder, "cron", minute="*/10")
-    sched.add_job(auto_backup,   "interval", days=3)
+    sched.add_job(auto_backup,   "cron", day_of_week="mon,wed,fri", hour=3, minute=0)
     sched.add_job(clean_old_markers, "cron", hour=3, minute=0)
     sched.start()
     logging.info("started, webhook -> %s", PUBLIC_URL + WEBHOOK_PATH)
@@ -654,6 +710,9 @@ def main():
     app.router.add_post("/api/students/delete",         api_delete_student)
     app.router.add_post("/api/students/delete-forever",  api_delete_student_forever)
     app.router.add_get("/api/history",           api_history)
+    app.router.add_post("/api/history/set",      api_history_set)
+    app.router.add_get("/api/notify",            api_notify)
+    app.router.add_post("/api/notify/set",       api_notify_set)
     # конструктор заданий
     app.router.add_get("/api/levels",            api_levels)
     app.router.add_post("/api/levels",           api_levels)
