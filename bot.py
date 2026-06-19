@@ -17,7 +17,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import (Message, InlineKeyboardMarkup,
                            InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand,
                            CallbackQuery)
-from aiogram.filters import CommandStart, Command, CallbackQueryFilter
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
