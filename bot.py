@@ -15,8 +15,9 @@ import pytz
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import (Message, InlineKeyboardMarkup,
-                           InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand)
-from aiogram.filters import CommandStart, Command
+                           InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand,
+                           CallbackQuery)
+from aiogram.filters import CommandStart, Command, CallbackQueryFilter
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -67,6 +68,12 @@ def init_db():
             created INTEGER, archived INTEGER DEFAULT 0)""")
         try: c.execute("ALTER TABLE students ADD COLUMN archived INTEGER DEFAULT 0")
         except Exception: pass
+        try: c.execute("ALTER TABLE students ADD COLUMN city TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE students ADD COLUMN timezone TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE students ADD COLUMN notes TEXT")
+        except Exception: pass
         # ---- конструктор заданий ----
         c.execute("""CREATE TABLE IF NOT EXISTS task_levels(
             id TEXT PRIMARY KEY, name TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
@@ -76,6 +83,40 @@ def init_db():
             id TEXT PRIMARY KEY, type TEXT, word TEXT, translation TEXT,
             choices TEXT, correct INTEGER DEFAULT 0,
             audio_file_id TEXT, group_id TEXT, level_id TEXT, created INTEGER)""")
+        try: c.execute("ALTER TABLE tasks ADD COLUMN sort INTEGER DEFAULT 0")
+        except Exception: pass
+        # ---- ученики ----
+        c.execute("""CREATE TABLE IF NOT EXISTS student_users(
+            student_id TEXT PRIMARY KEY,
+            chat_id INTEGER UNIQUE,
+            timezone TEXT DEFAULT 'Europe/Moscow',
+            connected_at INTEGER,
+            notif_homework INTEGER DEFAULT 1,
+            notif_hour INTEGER DEFAULT 1,
+            notif_day INTEGER DEFAULT 0)""")
+        # ---- домашние задания ----
+        c.execute("""CREATE TABLE IF NOT EXISTS assigned_tasks(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            task_id TEXT,
+            group_id TEXT,
+            assigned_at INTEGER,
+            status TEXT DEFAULT 'pending')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS task_progress(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            task_id TEXT,
+            assigned_id TEXT,
+            attempt INTEGER DEFAULT 1,
+            is_correct INTEGER DEFAULT 0,
+            input_value TEXT,
+            answered_at INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS homework_results(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            group_id TEXT,
+            completed_at INTEGER,
+            dismissed INTEGER DEFAULT 0)""")
         c.commit()
 
 # ---------------------- DB helpers ----------------------
@@ -143,13 +184,14 @@ def save_student(s):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO students
             (id,name,phone,contacts,price,duration,level,about,color,
-             trialUsed,created,archived)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+             trialUsed,created,archived,notes,city,timezone)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (s.get("id"), s.get("name",""), s.get("phone",""),
              s.get("contacts",""), s.get("price",""), s.get("duration",""),
              s.get("level",""), s.get("about",""), s.get("color",""),
              1 if s.get("trialUsed") else 0, s.get("created") or 0,
-             1 if s.get("archived") else 0))
+             1 if s.get("archived") else 0,
+             s.get("notes",""), s.get("city",""), s.get("timezone","")))
         c.commit()
 
 def delete_student(sid):
@@ -314,6 +356,139 @@ def check_init(request):
         return None
     return uid
 
+def check_init_student(request):
+    """Проверка для ученического Mini App — без ALLOWED_IDS."""
+    init = request.headers.get("X-Init-Data", "")
+    if not init:
+        return None
+    try:
+        data = safe_parse_webapp_init_data(token=BOT_TOKEN, init_data=init)
+        return data.user.id if data.user else None
+    except Exception:
+        return None
+
+# ---- ученики helpers ----
+def get_student_by_chat(chat_id):
+    with closing(db()) as c:
+        row = c.execute("SELECT * FROM student_users WHERE chat_id=?", (chat_id,)).fetchone()
+        return dict(row) if row else None
+
+def get_student_user(student_id):
+    with closing(db()) as c:
+        row = c.execute("SELECT * FROM student_users WHERE student_id=?", (student_id,)).fetchone()
+        return dict(row) if row else None
+
+def connect_student(student_id, chat_id, timezone="Europe/Moscow"):
+    with closing(db()) as c:
+        c.execute("""INSERT OR REPLACE INTO student_users
+            (student_id, chat_id, timezone, connected_at, notif_homework, notif_hour, notif_day)
+            VALUES(?,?,?,?,1,1,0)""",
+            (student_id, chat_id, timezone, int(datetime.now().timestamp()*1000)))
+        c.commit()
+
+def update_student_tz(student_id, timezone):
+    with closing(db()) as c:
+        c.execute("UPDATE student_users SET timezone=? WHERE student_id=?", (timezone, student_id))
+        c.commit()
+
+def update_student_notif(student_id, homework=None, hour=None, day=None):
+    with closing(db()) as c:
+        if homework is not None:
+            c.execute("UPDATE student_users SET notif_homework=? WHERE student_id=?", (1 if homework else 0, student_id))
+        if hour is not None:
+            c.execute("UPDATE student_users SET notif_hour=? WHERE student_id=?", (1 if hour else 0, student_id))
+        if day is not None:
+            c.execute("UPDATE student_users SET notif_day=? WHERE student_id=?", (1 if day else 0, student_id))
+        c.commit()
+
+# ---- домашние задания helpers ----
+import uuid as _uuid
+def new_id(): return _uuid.uuid4().hex
+
+def assign_homework(student_id, task_ids, group_id):
+    with closing(db()) as c:
+        now = int(datetime.now().timestamp()*1000)
+        for tid in task_ids:
+            c.execute("""INSERT INTO assigned_tasks(id,student_id,task_id,group_id,assigned_at,status)
+                VALUES(?,?,?,?,?,'pending')""",
+                (new_id(), student_id, tid, group_id, now))
+        c.commit()
+
+def get_student_homework(student_id):
+    with closing(db()) as c:
+        rows = c.execute("""
+            SELECT at.*, t.word, t.translation, t.type, t.choices, t.correct, t.audio_file_id,
+                   tg.name as group_name, tg.id as group_id
+            FROM assigned_tasks at
+            JOIN tasks t ON t.id=at.task_id
+            JOIN task_groups tg ON tg.id=at.group_id
+            WHERE at.student_id=?
+            ORDER BY at.assigned_at, at.id""", (student_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+def save_progress(student_id, task_id, assigned_id, is_correct, input_value=""):
+    with closing(db()) as c:
+        # считаем попытку
+        attempt = c.execute("""SELECT COUNT(*) FROM task_progress
+            WHERE student_id=? AND task_id=? AND assigned_id=?""",
+            (student_id, task_id, assigned_id)).fetchone()[0] + 1
+        c.execute("""INSERT INTO task_progress(id,student_id,task_id,assigned_id,attempt,is_correct,input_value,answered_at)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (new_id(), student_id, task_id, assigned_id, attempt,
+             1 if is_correct else 0, input_value, int(datetime.now().timestamp()*1000)))
+        # если правильно — помечаем assigned_task как done
+        if is_correct:
+            c.execute("UPDATE assigned_tasks SET status='done' WHERE id=?", (assigned_id,))
+        c.commit()
+
+def check_group_complete(student_id, group_id):
+    """Проверяет завершена ли вся группа заданий."""
+    with closing(db()) as c:
+        total = c.execute("SELECT COUNT(*) FROM assigned_tasks WHERE student_id=? AND group_id=?",
+                          (student_id, group_id)).fetchone()[0]
+        done = c.execute("""SELECT COUNT(*) FROM assigned_tasks
+            WHERE student_id=? AND group_id=? AND status='done'""",
+            (student_id, group_id)).fetchone()[0]
+        return total > 0 and done == total
+
+def save_homework_result(student_id, group_id):
+    with closing(db()) as c:
+        c.execute("""INSERT OR IGNORE INTO homework_results(id,student_id,group_id,completed_at,dismissed)
+            VALUES(?,?,?,?,0)""",
+            (new_id(), student_id, group_id, int(datetime.now().timestamp()*1000)))
+        c.commit()
+
+def get_homework_results(dismissed=False):
+    with closing(db()) as c:
+        rows = c.execute("""
+            SELECT hr.*, s.name as student_name, tg.name as group_name
+            FROM homework_results hr
+            LEFT JOIN students s ON s.id=hr.student_id
+            LEFT JOIN task_groups tg ON tg.id=hr.group_id
+            WHERE hr.dismissed=?
+            ORDER BY hr.completed_at DESC""", (1 if dismissed else 0,)).fetchall()
+        return [dict(r) for r in rows]
+
+def dismiss_result(result_id):
+    with closing(db()) as c:
+        c.execute("UPDATE homework_results SET dismissed=1 WHERE id=?", (result_id,))
+        c.commit()
+
+def get_task_stats(student_id, group_id):
+    """Статистика прохождения группы заданий."""
+    with closing(db()) as c:
+        rows = c.execute("""
+            SELECT t.word, t.translation, t.type,
+                   COUNT(tp.id) as attempts,
+                   SUM(tp.is_correct) as correct_count,
+                   GROUP_CONCAT(CASE WHEN tp.is_correct=0 THEN tp.input_value END, '|') as wrong_inputs
+            FROM assigned_tasks at
+            JOIN tasks t ON t.id=at.task_id
+            LEFT JOIN task_progress tp ON tp.assigned_id=at.id
+            WHERE at.student_id=? AND at.group_id=?
+            GROUP BY at.id, t.word""", (student_id, group_id)).fetchall()
+        return [dict(r) for r in rows]
+
 # ---------------------- API ----------------------
 @web.middleware
 async def cors(request, handler):
@@ -462,6 +637,179 @@ async def api_move_task(request):
     body=await request.json(); move_task_group(body["task_id"], body["group_id"])
     return web.json_response({"ok":True})
 
+# ---- API домашних заданий ----
+async def api_homework_assign(request):
+    """Назначить домашнее задание ученику. Только для Миляны."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    student_id = body.get("student_id")
+    task_ids = body.get("task_ids", [])
+    group_id = body.get("group_id")
+    if not student_id or not task_ids:
+        return web.json_response({"error": "missing fields"}, status=400)
+    assign_homework(student_id, task_ids, group_id)
+    # уведомление ученику
+    su = get_student_user(student_id)
+    if su and su.get("chat_id") and su.get("notif_homework", 1):
+        try:
+            await bot.send_message(su["chat_id"],
+                "📚 Вам пришло домашнее задание!")
+        except Exception as e:
+            logging.warning("notify student fail: %s", e)
+    return web.json_response({"ok": True})
+
+async def api_homework_student(request):
+    """Получить домашние задания для ученика (ученический Mini App)."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    hw = get_student_homework(su["student_id"])
+    return web.json_response({"homework": hw, "student": su})
+
+async def api_homework_progress(request):
+    """Записать прогресс ученика."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    body = await request.json()
+    save_progress(
+        su["student_id"],
+        body.get("task_id"),
+        body.get("assigned_id"),
+        body.get("is_correct", False),
+        body.get("input_value", "")
+    )
+    # проверяем завершена ли группа
+    group_id = body.get("group_id")
+    if group_id and check_group_complete(su["student_id"], group_id):
+        save_homework_result(su["student_id"], group_id)
+        # уведомляем Милян
+        for chat_id in notify_users():
+            if get_setting(f"notify_hw_results_{chat_id}", "0") == "1":
+                stu = next((s for s in list_students() if s["id"] == su["student_id"]), None)
+                stu_name = stu["name"] if stu else "Ученик"
+                with closing(db()) as c:
+                    grp = c.execute("SELECT name FROM task_groups WHERE id=?", (group_id,)).fetchone()
+                grp_name = grp["name"] if grp else "задание"
+                try:
+                    await bot.send_message(chat_id,
+                        f"✅ {stu_name} выполнил домашнее задание «{grp_name}»!")
+                except Exception as e:
+                    logging.warning("notify teacher fail: %s", e)
+    return web.json_response({"ok": True})
+
+async def api_homework_results(request):
+    """Результаты выполненных домашних заданий (для колокольчика)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    results = get_homework_results(dismissed=False)
+    return web.json_response({"results": results})
+
+async def api_homework_stats(request):
+    """Статистика прохождения конкретной домашки."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    student_id = request.query.get("student_id")
+    group_id = request.query.get("group_id")
+    stats = get_task_stats(student_id, group_id)
+    return web.json_response({"stats": stats})
+
+async def api_homework_dismiss(request):
+    """Отметить уведомление о домашке как прочитанное."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    dismiss_result(body.get("id"))
+    return web.json_response({"ok": True})
+
+async def api_student_connect(request):
+    """Проверка подключения ученика и обновление настроек."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"connected": False})
+    return web.json_response({"connected": True, "student": su})
+
+async def api_student_notif(request):
+    """Получить/обновить настройки уведомлений ученика."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    if request.method == "POST":
+        body = await request.json()
+        update_student_notif(
+            su["student_id"],
+            homework=body.get("homework"),
+            hour=body.get("hour"),
+            day=body.get("day")
+        )
+        if "timezone" in body:
+            update_student_tz(su["student_id"], body["timezone"])
+        return web.json_response({"ok": True})
+    return web.json_response({
+        "notif_homework": su.get("notif_homework", 1),
+        "notif_hour": su.get("notif_hour", 1),
+        "notif_day": su.get("notif_day", 0),
+        "timezone": su.get("timezone", "Europe/Moscow")
+    })
+
+async def api_student_connected_list(request):
+    """Список подключённых учеников (для индикатора ✓)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    with closing(db()) as c:
+        rows = c.execute("SELECT student_id FROM student_users").fetchall()
+    return web.json_response({"connected": [r["student_id"] for r in rows]})
+
+async def api_broadcast(request):
+    """Рассылка сообщения выбранным ученикам."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    text = body.get("text", "").strip()
+    student_ids = body.get("student_ids", [])
+    is_html = body.get("html", False)
+    if not text or not student_ids:
+        return web.json_response({"error": "missing fields"}, status=400)
+    sent, failed = 0, 0
+    for sid in student_ids:
+        su = get_student_user(sid)
+        if not su or not su.get("chat_id"):
+            failed += 1
+            continue
+        try:
+            if is_html:
+                await bot.send_message(su["chat_id"], f"🌸 {text}", parse_mode="HTML")
+            else:
+                await bot.send_message(su["chat_id"], f"🌸 {text}")
+            sent += 1
+        except Exception as e:
+            logging.warning("broadcast fail %s: %s", sid, e)
+            failed += 1
+    return web.json_response({"ok": True, "sent": sent, "failed": failed})
+
+async def api_tasks_reorder(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    with closing(db()) as c:
+        for idx, tid in enumerate(body.get("ids", [])):
+            c.execute("UPDATE tasks SET sort=? WHERE id=?", (idx, tid))
+        c.commit()
+    return web.json_response({"ok": True})
+
 async def api_audio(request):
     """Возвращает прямую ссылку на аудио-файл по file_id."""
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
@@ -491,6 +839,45 @@ def dev_menu_text():
 
 @dp.message(CommandStart())
 async def start(m: Message):
+    args = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else ""
+    # реферальная ссылка ученика: /start s_STUDENTID
+    if args.startswith("s_"):
+        student_id = args[2:]
+        # проверяем что такой ученик есть
+        with closing(db()) as c:
+            stu = c.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+        if not stu:
+            await m.answer("Ссылка недействительна.")
+            return
+        # определяем часовой пояс — спрашиваем у ученика
+        existing = get_student_user(student_id)
+        connect_student(student_id, m.from_user.id)
+        STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📖 Открыть задания",
+                                 web_app=WebAppInfo(url=STUDENT_URL))
+        ]])
+        if not existing:
+            # новый ученик — спрашиваем часовой пояс
+            tz_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏙 Москва (UTC+3)", callback_data=f"tz_{student_id}_Europe/Moscow")],
+                [InlineKeyboardButton(text="🌆 Екатеринбург (UTC+5)", callback_data=f"tz_{student_id}_Asia/Yekaterinburg")],
+                [InlineKeyboardButton(text="🌃 Новосибирск (UTC+7)", callback_data=f"tz_{student_id}_Asia/Novosibirsk")],
+                [InlineKeyboardButton(text="🌉 Иркутск (UTC+8)", callback_data=f"tz_{student_id}_Asia/Irkutsk")],
+                [InlineKeyboardButton(text="🌁 Владивосток (UTC+10)", callback_data=f"tz_{student_id}_Asia/Vladivostok")],
+                [InlineKeyboardButton(text="🌍 Белград (UTC+2)", callback_data=f"tz_{student_id}_Europe/Belgrade")],
+                [InlineKeyboardButton(text="Другой город", callback_data=f"tz_{student_id}_ask")],
+            ])
+            await m.answer(
+                f"Привет! Вы подключились к урокам сербского языка. 🌸\n\n"
+                f"Для правильной отправки уведомлений — выберите ваш часовой пояс:",
+                reply_markup=tz_kb)
+        else:
+            await m.answer(
+                "Вы уже подключены! 🌸\nОткрывайте задания по кнопке ниже.",
+                reply_markup=kb)
+        return
+
     if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
         await m.answer("Этот календарь только для преподавателя.")
         return
@@ -518,8 +905,79 @@ async def start(m: Message):
             "Открыть календарь или конструктор заданий — кнопками ниже.",
             reply_markup=kb)
 
-@dp.message(Command("tasks"))
-async def cmd_tasks(m: Message):
+@dp.callback_query(lambda c: c.data and c.data.startswith("tz_"))
+async def cb_timezone(call: CallbackQuery):
+    parts = call.data.split("_", 2)
+    student_id = parts[1]
+    tz_val = parts[2] if len(parts) > 2 else "Europe/Moscow"
+    STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📖 Открыть задания",
+                             web_app=WebAppInfo(url=STUDENT_URL))
+    ]])
+    if tz_val == "ask":
+        await call.message.edit_text(
+            "Введите название вашего города (например: Казань, Омск, Самара):\n\n"
+            "_Или просто нажмите кнопку ниже — мы определим автоматически при первом входе._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📖 Открыть задания (определим автоматически)",
+                                     web_app=WebAppInfo(url=STUDENT_URL))
+            ]]))
+    else:
+        update_student_tz(student_id, tz_val)
+        tz_display = tz_val.split("/")[-1].replace("_", " ")
+        await call.message.edit_text(
+            f"✅ Отлично! Часовой пояс: {tz_display}\n\n"
+            f"Теперь вы будете получать уведомления в правильное время. 🌸\n"
+            f"Открывайте задания по кнопке ниже:",
+            reply_markup=kb)
+    await call.answer()
+
+async def notify_students_hour():
+    """Уведомление ученикам за час до урока."""
+    now = datetime.now(tz)
+    target = now + timedelta(hours=1)
+    target_time = target.strftime("%H:%M")
+    date_str = now.strftime("%Y-%m-%d")
+    lessons = day_lessons(date_str)
+    for L in lessons:
+        if L.get("time") != target_time or not L.get("studentId"):
+            continue
+        su = get_student_user(L["studentId"])
+        if not su or not su.get("chat_id") or not su.get("notif_hour", 1):
+            continue
+        try:
+            # пересчёт времени для часового пояса ученика
+            student_tz = pytz.timezone(su.get("timezone", "Europe/Moscow"))
+            lesson_dt = tz.localize(datetime.strptime(f"{date_str} {L['time']}", "%Y-%m-%d %H:%M"))
+            student_time = lesson_dt.astimezone(student_tz).strftime("%H:%M")
+            await bot.send_message(su["chat_id"],
+                f"⏰ Через час занятие по сербскому языку — в {student_time}!")
+        except Exception as e:
+            logging.warning("student hour notify fail: %s", e)
+
+async def notify_students_day():
+    """Утреннее уведомление ученикам о занятии сегодня."""
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    lessons = day_lessons(today)
+    notified = set()
+    for L in lessons:
+        sid = L.get("studentId")
+        if not sid or sid in notified:
+            continue
+        su = get_student_user(sid)
+        if not su or not su.get("chat_id") or not su.get("notif_day", 0):
+            continue
+        try:
+            student_tz = pytz.timezone(su.get("timezone", "Europe/Moscow"))
+            lesson_dt = tz.localize(datetime.strptime(f"{today} {L['time']}", "%Y-%m-%d %H:%M"))
+            student_time = lesson_dt.astimezone(student_tz).strftime("%H:%M")
+            await bot.send_message(su["chat_id"],
+                f"🌸 Сегодня занятие по сербскому языку в {student_time}!")
+            notified.add(sid)
+        except Exception as e:
+            logging.warning("student day notify fail: %s", e)
     if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -692,6 +1150,8 @@ async def on_startup(app):
     sched.add_job(morning,       "cron", hour=NOTIFY_HOUR, minute=NOTIFY_MIN)
     sched.add_job(evening,       "cron", hour=20, minute=0)
     sched.add_job(hour_reminder, "cron", minute="*/10")
+    sched.add_job(notify_students_hour, "cron", minute="*/10")
+    sched.add_job(notify_students_day,  "cron", hour=8, minute=5)
     sched.add_job(auto_backup,   "cron", day_of_week="mon,wed,fri", hour=3, minute=0)
     sched.add_job(clean_old_markers, "cron", hour=3, minute=0)
     sched.start()
@@ -725,6 +1185,21 @@ def main():
     app.router.add_post("/api/tasks/delete",     api_delete_task)
     app.router.add_post("/api/tasks/move",       api_move_task)
     app.router.add_get("/api/audio",             api_audio)
+    # домашние задания
+    app.router.add_post("/api/homework/assign",  api_homework_assign)
+    app.router.add_get("/api/homework/student",  api_homework_student)
+    app.router.add_post("/api/homework/progress",api_homework_progress)
+    app.router.add_get("/api/homework/results",  api_homework_results)
+    app.router.add_get("/api/homework/stats",    api_homework_stats)
+    app.router.add_post("/api/homework/dismiss", api_homework_dismiss)
+    # ученик
+    app.router.add_get("/api/student/connect",   api_student_connect)
+    app.router.add_get("/api/student/notif",     api_student_notif)
+    app.router.add_post("/api/student/notif",    api_student_notif)
+    app.router.add_get("/api/students/connected",api_student_connected_list)
+    app.router.add_post("/api/broadcast",        api_broadcast)
+    # задания
+    app.router.add_post("/api/tasks/reorder",    api_tasks_reorder)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
