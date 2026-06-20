@@ -8,6 +8,8 @@ Ljubičasto — бэкенд календаря репетитора.
 import os
 import sqlite3
 import logging
+import base64
+import io
 from datetime import datetime, timedelta
 from contextlib import closing
 
@@ -16,14 +18,15 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import (Message, InlineKeyboardMarkup,
                            InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand,
-                           CallbackQuery)
+                           CallbackQuery, BufferedInputFile)
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=20"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=21"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=21"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -74,9 +77,13 @@ def init_db():
         except Exception: pass
         try: c.execute("ALTER TABLE students ADD COLUMN notes TEXT")
         except Exception: pass
+        try: c.execute("ALTER TABLE students ADD COLUMN greeting_name TEXT")
+        except Exception: pass
         # ---- конструктор заданий ----
         c.execute("""CREATE TABLE IF NOT EXISTS task_levels(
             id TEXT PRIMARY KEY, name TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
+        try: c.execute("ALTER TABLE task_levels ADD COLUMN is_cards INTEGER DEFAULT 0")
+        except Exception: pass
         c.execute("""CREATE TABLE IF NOT EXISTS task_groups(
             id TEXT PRIMARY KEY, name TEXT, level_id TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS tasks(
@@ -85,6 +92,20 @@ def init_db():
             audio_file_id TEXT, group_id TEXT, level_id TEXT, created INTEGER)""")
         try: c.execute("ALTER TABLE tasks ADD COLUMN sort INTEGER DEFAULT 0")
         except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN word_comment TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN choice_comments TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN photo TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN photo_choice TEXT")
+        except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN photo_input TEXT")
+        except Exception: pass
+        # ---- карточки (особый уровень с фото) ----
+        c.execute("""CREATE TABLE IF NOT EXISTS task_cards(
+            id TEXT PRIMARY KEY, group_id TEXT, title TEXT,
+            photo_file_id TEXT, audio_file_id TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
         # ---- ученики ----
         c.execute("""CREATE TABLE IF NOT EXISTS student_users(
             student_id TEXT PRIMARY KEY,
@@ -94,6 +115,18 @@ def init_db():
             notif_homework INTEGER DEFAULT 1,
             notif_hour INTEGER DEFAULT 1,
             notif_day INTEGER DEFAULT 0)""")
+        try: c.execute("ALTER TABLE student_users ADD COLUMN notif_cards INTEGER DEFAULT 1")
+        except Exception: pass
+        try: c.execute("ALTER TABLE student_users ADD COLUMN notif_posts INTEGER DEFAULT 1")
+        except Exception: pass
+        try: c.execute("ALTER TABLE student_users ADD COLUMN onboarding_done INTEGER DEFAULT 0")
+        except Exception: pass
+        # ---- просмотр карточек учеником ----
+        c.execute("""CREATE TABLE IF NOT EXISTS card_views(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            group_id TEXT,
+            viewed_at INTEGER)""")
         # ---- домашние задания ----
         c.execute("""CREATE TABLE IF NOT EXISTS assigned_tasks(
             id TEXT PRIMARY KEY,
@@ -117,6 +150,15 @@ def init_db():
             group_id TEXT,
             completed_at INTEGER,
             dismissed INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_messages(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            text TEXT,
+            photo_file_id TEXT,
+            sent_at INTEGER,
+            expires_at INTEGER)""")
+        try: c.execute("ALTER TABLE broadcast_messages ADD COLUMN expires_at INTEGER")
+        except Exception: pass
         c.commit()
 
 # ---------------------- DB helpers ----------------------
@@ -124,6 +166,55 @@ def day_lessons(date):
     with closing(db()) as c:
         rows = c.execute("SELECT * FROM lessons WHERE date=? ORDER BY time", (date,)).fetchall()
         return [dict(r) for r in rows]
+
+def get_student_next_lesson(student_id, student_tz_name=None):
+    """Ближайший будущий урок ученика + его номер по счёту (без пробных), как в календаре.
+    Если передан student_tz_name — время урока пересчитывается под часовой пояс ученика
+    (дата/время в БД всегда хранятся в московском времени)."""
+    now = datetime.now(tz)
+    today_str = now.strftime("%Y-%m-%d")
+    with closing(db()) as c:
+        # все уроки этого ученика, отсортированные по дате+времени
+        rows = c.execute(
+            "SELECT * FROM lessons WHERE studentId=? ORDER BY date, time", (student_id,)
+        ).fetchall()
+    all_lessons = [dict(r) for r in rows]
+    not_trial = [L for L in all_lessons if not L.get("trial")]
+    # ищем первый урок (среди непробных) который ещё не наступил
+    next_lesson = None
+    next_idx = None
+    next_lesson_dt = None
+    for idx, L in enumerate(not_trial):
+        lesson_dt_str = f"{L['date']} {L['time']}"
+        try:
+            lesson_dt = tz.localize(datetime.strptime(lesson_dt_str, "%Y-%m-%d %H:%M"))
+        except Exception:
+            continue
+        if lesson_dt >= now:
+            next_lesson = L
+            next_idx = idx
+            next_lesson_dt = lesson_dt
+            break
+    if not next_lesson:
+        return None
+
+    result_date, result_time = next_lesson["date"], next_lesson["time"]
+    if student_tz_name:
+        try:
+            student_tz = pytz.timezone(student_tz_name)
+            local_dt = next_lesson_dt.astimezone(student_tz)
+            result_date = local_dt.strftime("%Y-%m-%d")
+            result_time = local_dt.strftime("%H:%M")
+        except Exception:
+            pass  # если пояс некорректный — отдаём московское время как есть
+
+    return {
+        "date": result_date,
+        "time": result_time,
+        "lesson_number": next_idx + 1,  # позиция в списке непробных, 1-based
+        "price": next_lesson.get("price", ""),
+        "level": next_lesson.get("level", ""),
+    }
 
 def replace_day(date, lessons):
     with closing(db()) as c:
@@ -184,14 +275,15 @@ def save_student(s):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO students
             (id,name,phone,contacts,price,duration,level,about,color,
-             trialUsed,created,archived,notes,city,timezone)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             trialUsed,created,archived,notes,city,timezone,greeting_name)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (s.get("id"), s.get("name",""), s.get("phone",""),
              s.get("contacts",""), s.get("price",""), s.get("duration",""),
              s.get("level",""), s.get("about",""), s.get("color",""),
              1 if s.get("trialUsed") else 0, s.get("created") or 0,
              1 if s.get("archived") else 0,
-             s.get("notes",""), s.get("city",""), s.get("timezone","")))
+             s.get("notes",""), s.get("city",""), s.get("timezone",""),
+             s.get("greeting_name","")))
         c.commit()
 
 def delete_student(sid):
@@ -246,10 +338,13 @@ def count_tasks_in_group(gid):
 
 def delete_group(gid, force=False):
     with closing(db()) as c:
-        count = c.execute("SELECT COUNT(*) FROM tasks WHERE group_id=?", (gid,)).fetchone()[0]
+        tcount = c.execute("SELECT COUNT(*) FROM tasks WHERE group_id=?", (gid,)).fetchone()[0]
+        ccount = c.execute("SELECT COUNT(*) FROM task_cards WHERE group_id=?", (gid,)).fetchone()[0]
+        count = tcount + ccount
         if count > 0 and not force:
             return {"ok": False, "count": count}
         c.execute("DELETE FROM tasks WHERE group_id=?", (gid,))
+        c.execute("DELETE FROM task_cards WHERE group_id=?", (gid,))
         c.execute("DELETE FROM task_groups WHERE id=?", (gid,))
         c.commit()
         return {"ok": True}
@@ -257,21 +352,24 @@ def delete_group(gid, force=False):
 def list_tasks(group_id=None, level_id=None):
     with closing(db()) as c:
         if group_id:
-            rows=c.execute("SELECT * FROM tasks WHERE group_id=? ORDER BY created",(group_id,)).fetchall()
+            rows=c.execute("SELECT * FROM tasks WHERE group_id=? ORDER BY sort",(group_id,)).fetchall()
         elif level_id:
-            rows=c.execute("SELECT * FROM tasks WHERE level_id=? ORDER BY created",(level_id,)).fetchall()
+            rows=c.execute("SELECT * FROM tasks WHERE level_id=? ORDER BY sort",(level_id,)).fetchall()
         else:
-            rows=c.execute("SELECT * FROM tasks ORDER BY created").fetchall()
+            rows=c.execute("SELECT * FROM tasks ORDER BY sort").fetchall()
         return [dict(r) for r in rows]
 
 def save_task(t):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO tasks
-            (id,type,word,translation,choices,correct,audio_file_id,group_id,level_id,created)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (id,type,word,translation,choices,correct,audio_file_id,group_id,level_id,created,
+             sort,word_comment,choice_comments,photo,photo_choice,photo_input)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (t["id"], t.get("type","choice"), t.get("word",""), t.get("translation",""),
              t.get("choices",""), t.get("correct",0), t.get("audio_file_id",""),
-             t.get("group_id",""), t.get("level_id",""), t.get("created",0)))
+             t.get("group_id",""), t.get("level_id",""), t.get("created",0),
+             t.get("sort",0), t.get("word_comment",""), t.get("choice_comments","[]"),
+             t.get("photo",""), t.get("photo_choice",""), t.get("photo_input","")))
         c.commit()
 
 def move_task_group(task_id, new_group_id):
@@ -322,6 +420,14 @@ def db_stats():
     size_kb = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
     return students, lessons, markers, size_kb
 
+def clean_expired_broadcasts():
+    """Удаляем из базы рассылки, у которых истёк срок жизни (>7 дней после expires_at — на всякий случай)."""
+    cutoff = int(datetime.now().timestamp() * 1000) - 7 * 86400 * 1000
+    with closing(db()) as c:
+        c.execute("""DELETE FROM broadcast_messages
+            WHERE expires_at IS NOT NULL AND expires_at < ?""", (cutoff,))
+        c.commit()
+
 def clean_old_markers():
     """Удаляем маркеры напоминаний для уроков, дата которых уже прошла (>2 дней назад)."""
     cutoff = (datetime.now(tz) - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -370,7 +476,11 @@ def check_init_student(request):
 # ---- ученики helpers ----
 def get_student_by_chat(chat_id):
     with closing(db()) as c:
-        row = c.execute("SELECT * FROM student_users WHERE chat_id=?", (chat_id,)).fetchone()
+        row = c.execute("""
+            SELECT su.*, s.greeting_name as greeting_name, s.timezone as preset_timezone
+            FROM student_users su
+            LEFT JOIN students s ON s.id = su.student_id
+            WHERE su.chat_id=?""", (chat_id,)).fetchone()
         return dict(row) if row else None
 
 def get_student_user(student_id):
@@ -381,8 +491,8 @@ def get_student_user(student_id):
 def connect_student(student_id, chat_id, timezone="Europe/Moscow"):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO student_users
-            (student_id, chat_id, timezone, connected_at, notif_homework, notif_hour, notif_day)
-            VALUES(?,?,?,?,1,1,0)""",
+            (student_id, chat_id, timezone, connected_at, notif_homework, notif_hour, notif_day, notif_cards, notif_posts)
+            VALUES(?,?,?,?,1,1,0,1,1)""",
             (student_id, chat_id, timezone, int(datetime.now().timestamp()*1000)))
         c.commit()
 
@@ -391,7 +501,7 @@ def update_student_tz(student_id, timezone):
         c.execute("UPDATE student_users SET timezone=? WHERE student_id=?", (timezone, student_id))
         c.commit()
 
-def update_student_notif(student_id, homework=None, hour=None, day=None):
+def update_student_notif(student_id, homework=None, hour=None, day=None, cards=None, posts=None):
     with closing(db()) as c:
         if homework is not None:
             c.execute("UPDATE student_users SET notif_homework=? WHERE student_id=?", (1 if homework else 0, student_id))
@@ -399,6 +509,10 @@ def update_student_notif(student_id, homework=None, hour=None, day=None):
             c.execute("UPDATE student_users SET notif_hour=? WHERE student_id=?", (1 if hour else 0, student_id))
         if day is not None:
             c.execute("UPDATE student_users SET notif_day=? WHERE student_id=?", (1 if day else 0, student_id))
+        if cards is not None:
+            c.execute("UPDATE student_users SET notif_cards=? WHERE student_id=?", (1 if cards else 0, student_id))
+        if posts is not None:
+            c.execute("UPDATE student_users SET notif_posts=? WHERE student_id=?", (1 if posts else 0, student_id))
         c.commit()
 
 # ---- домашние задания helpers ----
@@ -418,6 +532,7 @@ def get_student_homework(student_id):
     with closing(db()) as c:
         rows = c.execute("""
             SELECT at.*, t.word, t.translation, t.type, t.choices, t.correct, t.audio_file_id,
+                   t.word_comment, t.choice_comments, t.photo, t.photo_choice, t.photo_input,
                    tg.name as group_name, tg.id as group_id
             FROM assigned_tasks at
             JOIN tasks t ON t.id=at.task_id
@@ -610,7 +725,25 @@ async def api_delete_level(request):
 async def api_groups(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
     if request.method=="POST":
-        save_group(await request.json()); return web.json_response({"ok":True})
+        body = await request.json()
+        with closing(db()) as c:
+            is_new = c.execute("SELECT 1 FROM task_groups WHERE id=?", (body.get("id"),)).fetchone() is None
+        save_group(body)
+        # уведомляем подключённых учеников о новой группе карточек (не о заданиях — те назначаются персонально)
+        if is_new:
+            with closing(db()) as c:
+                lvl = c.execute("SELECT is_cards FROM task_levels WHERE id=?", (body.get("level_id"),)).fetchone()
+            if lvl and lvl["is_cards"]:
+                with closing(db()) as c:
+                    students = c.execute(
+                        "SELECT chat_id FROM student_users WHERE notif_cards=1 AND chat_id IS NOT NULL"
+                    ).fetchall()
+                for s in students:
+                    try:
+                        await bot.send_message(s["chat_id"], f"🖼 Новые карточки: «{body.get('name','')}»")
+                    except Exception as e:
+                        logging.warning("notify cards fail: %s", e)
+        return web.json_response({"ok":True})
     level_id=request.query.get("level_id")
     return web.json_response({"groups": list_groups(level_id)})
 
@@ -623,9 +756,34 @@ async def api_delete_group(request):
 async def api_tasks(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
     if request.method=="POST":
-        save_task(await request.json()); return web.json_response({"ok":True})
+        body = await request.json()
+        # если фото пришло как base64 — конвертируем в Telegram file_id, чтобы не раздувать базу
+        photo_val = body.get("photo", "")
+        if photo_val and photo_val.startswith("data:"):
+            try:
+                raw = photo_val.split(",", 1)[-1]
+                photo_bytes = base64.b64decode(raw)
+                msg = await bot.send_photo(
+                    DEV_ID, BufferedInputFile(photo_bytes, filename="task.jpg"),
+                    caption="📌 Фото для задания сохранено"
+                )
+                if msg.photo:
+                    body["photo"] = msg.photo[-1].file_id
+            except Exception as e:
+                logging.warning("task photo upload fail: %s", e)
+        save_task(body)
+        return web.json_response({"ok":True})
     group_id=request.query.get("group_id"); level_id=request.query.get("level_id")
-    return web.json_response({"tasks": list_tasks(group_id, level_id)})
+    tasks = list_tasks(group_id, level_id)
+    # отдаём прямую ссылку на фото вместо file_id
+    for t in tasks:
+        if t.get("photo"):
+            try:
+                f = await bot.get_file(t["photo"])
+                t["photo"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                t["photo"] = ""
+    return web.json_response({"tasks": tasks})
 
 async def api_delete_task(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
@@ -659,6 +817,19 @@ async def api_homework_assign(request):
             logging.warning("notify student fail: %s", e)
     return web.json_response({"ok": True})
 
+async def api_student_next_lesson(request):
+    """Ближайший урок ученика — для шапки ученического Mini App.
+    Время урока пересчитывается под часовой пояс, который выбрал ученик."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    student_tz_name = su.get("timezone") or "Europe/Moscow"
+    lesson = get_student_next_lesson(su["student_id"], student_tz_name)
+    return web.json_response({"lesson": lesson, "timezone": student_tz_name})
+
 async def api_homework_student(request):
     """Получить домашние задания для ученика (ученический Mini App)."""
     uid = check_init_student(request)
@@ -668,6 +839,13 @@ async def api_homework_student(request):
     if not su:
         return web.json_response({"error": "not connected"}, status=403)
     hw = get_student_homework(su["student_id"])
+    for t in hw:
+        if t.get("photo"):
+            try:
+                f = await bot.get_file(t["photo"])
+                t["photo"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                t["photo"] = ""
     return web.json_response({"homework": hw, "student": su})
 
 async def api_homework_progress(request):
@@ -729,6 +907,19 @@ async def api_homework_dismiss(request):
     dismiss_result(body.get("id"))
     return web.json_response({"ok": True})
 
+async def api_student_onboarding_done(request):
+    """Отметить что ученик прошёл обучающий тур — больше не показываем."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    with closing(db()) as c:
+        c.execute("UPDATE student_users SET onboarding_done=1 WHERE student_id=?", (su["student_id"],))
+        c.commit()
+    return web.json_response({"ok": True})
+
 async def api_student_connect(request):
     """Проверка подключения ученика и обновление настроек."""
     uid = check_init_student(request)
@@ -740,28 +931,42 @@ async def api_student_connect(request):
     return web.json_response({"connected": True, "student": su})
 
 async def api_student_notif(request):
-    """Получить/обновить настройки уведомлений ученика."""
-    uid = check_init_student(request)
-    if uid is None:
-        return web.json_response({"error": "auth"}, status=403)
-    su = get_student_by_chat(uid)
+    """Получить/обновить настройки уведомлений ученика.
+    Доступ либо самому ученику (по его chat_id), либо Миляне (по ALLOWED_IDS + явный student_id)."""
+    student_id_override = request.query.get("student_id")
+    su = None
+    if student_id_override and check_init(request) is not None:
+        # запрос от Миляны/DEV — student_id передан явно
+        su = get_student_user(student_id_override)
+        target_student_id = student_id_override
+    else:
+        uid = check_init_student(request)
+        if uid is None:
+            return web.json_response({"error": "auth"}, status=403)
+        su = get_student_by_chat(uid)
+        target_student_id = su["student_id"] if su else None
     if not su:
         return web.json_response({"error": "not connected"}, status=403)
     if request.method == "POST":
         body = await request.json()
+        body_student_id = body.get("student_id") or target_student_id
         update_student_notif(
-            su["student_id"],
+            body_student_id,
             homework=body.get("homework"),
             hour=body.get("hour"),
-            day=body.get("day")
+            day=body.get("day"),
+            cards=body.get("cards"),
+            posts=body.get("posts"),
         )
         if "timezone" in body:
-            update_student_tz(su["student_id"], body["timezone"])
+            update_student_tz(body_student_id, body["timezone"])
         return web.json_response({"ok": True})
     return web.json_response({
         "notif_homework": su.get("notif_homework", 1),
         "notif_hour": su.get("notif_hour", 1),
         "notif_day": su.get("notif_day", 0),
+        "notif_cards": su.get("notif_cards", 1),
+        "notif_posts": su.get("notif_posts", 1),
         "timezone": su.get("timezone", "Europe/Moscow")
     })
 
@@ -774,14 +979,17 @@ async def api_student_connected_list(request):
     return web.json_response({"connected": [r["student_id"] for r in rows]})
 
 async def api_broadcast(request):
-    """Рассылка сообщения выбранным ученикам."""
+    """Рассылка сообщения (с опциональным фото) выбранным ученикам."""
     if check_init(request) is None:
         return web.json_response({"error": "auth"}, status=403)
     body = await request.json()
     text = body.get("text", "").strip()
     student_ids = body.get("student_ids", [])
     is_html = body.get("html", False)
-    if not text or not student_ids:
+    photo_b64 = body.get("photo")  # data:image/...;base64,XXXX или просто base64
+    ttl_days = body.get("ttl_days", 7)
+    expires_at = None if ttl_days is None else int(datetime.now().timestamp() * 1000) + ttl_days * 86400 * 1000
+    if not (text or photo_b64) or not student_ids:
         return web.json_response({"error": "missing fields"}, status=400)
     sent, failed = 0, 0
     for sid in student_ids:
@@ -790,15 +998,68 @@ async def api_broadcast(request):
             failed += 1
             continue
         try:
-            if is_html:
-                await bot.send_message(su["chat_id"], f"🌸 {text}", parse_mode="HTML")
+            photo_file_id = None
+            caption = f"🌸 {text}" if text else None
+            wants_chat_msg = su.get("notif_posts", 1) == 1
+            if photo_b64:
+                raw = photo_b64.split(",", 1)[-1]
+                photo_bytes = base64.b64decode(raw)
+                if wants_chat_msg:
+                    msg = await bot.send_photo(
+                        su["chat_id"], BufferedInputFile(photo_bytes, filename="broadcast.jpg"),
+                        caption=caption, parse_mode="HTML" if is_html else None
+                    )
+                    if msg.photo:
+                        photo_file_id = msg.photo[-1].file_id
+                else:
+                    # не шлём в чат, но всё равно нужен file_id для отображения в приложении —
+                    # отправляем себе (DEV) тихо, чтобы получить file_id без уведомления ученика
+                    msg = await bot.send_photo(
+                        DEV_ID, BufferedInputFile(photo_bytes, filename="broadcast.jpg"),
+                        caption="📌 фото поста (тихая рассылка)"
+                    )
+                    if msg.photo:
+                        photo_file_id = msg.photo[-1].file_id
             else:
-                await bot.send_message(su["chat_id"], f"🌸 {text}")
+                if wants_chat_msg:
+                    await bot.send_message(su["chat_id"], caption, parse_mode="HTML" if is_html else None)
             sent += 1
+            # сохраняем в историю сообщений ученика
+            with closing(db()) as c:
+                c.execute("""INSERT INTO broadcast_messages(id,student_id,text,photo_file_id,sent_at,expires_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (new_id(), sid, text, photo_file_id, int(datetime.now().timestamp()*1000), expires_at))
+                c.commit()
         except Exception as e:
             logging.warning("broadcast fail %s: %s", sid, e)
             failed += 1
     return web.json_response({"ok": True, "sent": sent, "failed": failed})
+
+async def api_student_messages(request):
+    """Получить сообщения от Миляны для ученика (для карусели). Истёкшие не показываются."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    now = int(datetime.now().timestamp() * 1000)
+    with closing(db()) as c:
+        rows = c.execute("""SELECT * FROM broadcast_messages
+            WHERE student_id=? AND (expires_at IS NULL OR expires_at>?)
+            ORDER BY sent_at DESC LIMIT 20""",
+            (su["student_id"], now)).fetchall()
+    messages = []
+    for r in rows:
+        d = dict(r)
+        if d.get("photo_file_id"):
+            try:
+                f = await bot.get_file(d["photo_file_id"])
+                d["photo_url"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                d["photo_url"] = None
+        messages.append(d)
+    return web.json_response({"messages": messages})
 
 async def api_tasks_reorder(request):
     if check_init(request) is None:
@@ -809,6 +1070,143 @@ async def api_tasks_reorder(request):
             c.execute("UPDATE tasks SET sort=? WHERE id=?", (idx, tid))
         c.commit()
     return web.json_response({"ok": True})
+
+async def api_cards(request):
+    """CRUD для карточек (раздел «Карточки»)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    if request.method == "POST":
+        body = await request.json()
+        with closing(db()) as c:
+            c.execute("""INSERT OR REPLACE INTO task_cards
+                (id,group_id,title,photo_file_id,audio_file_id,sort,created)
+                VALUES(?,?,?,?,?,?,?)""",
+                (body.get("id"), body.get("group_id"), body.get("title",""),
+                 body.get("photo_file_id") or body.get("photo",""),
+                 body.get("audio_file_id",""), body.get("sort",0), body.get("created") or 0))
+            c.commit()
+        return web.json_response({"ok": True})
+    group_id = request.query.get("group_id")
+    with closing(db()) as c:
+        if group_id:
+            rows = c.execute("SELECT * FROM task_cards WHERE group_id=? ORDER BY sort", (group_id,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM task_cards ORDER BY sort").fetchall()
+    cards = [dict(r) for r in rows]
+    # отдаём фронту фото как прямую ссылку (фронт хранит её как "photo")
+    for c_ in cards:
+        c_["photo"] = ""
+        if c_.get("photo_file_id"):
+            try:
+                f = await bot.get_file(c_["photo_file_id"])
+                c_["photo"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                pass
+    return web.json_response({"cards": cards})
+
+async def api_cards_delete(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    with closing(db()) as c:
+        c.execute("DELETE FROM task_cards WHERE id=?", (body.get("id"),))
+        c.commit()
+    return web.json_response({"ok": True})
+
+async def api_student_cards(request):
+    """Список групп карточек для ученика — с фото, аудио и статусом просмотра."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    student_id = su["student_id"]
+    with closing(db()) as c:
+        cards_level = c.execute("SELECT id FROM task_levels WHERE is_cards=1 LIMIT 1").fetchone()
+        if not cards_level:
+            return web.json_response({"groups": []})
+        groups_rows = c.execute(
+            "SELECT * FROM task_groups WHERE level_id=? ORDER BY sort", (cards_level["id"],)
+        ).fetchall()
+        viewed_rows = c.execute(
+            "SELECT group_id FROM card_views WHERE student_id=?", (student_id,)
+        ).fetchall()
+        viewed_ids = {r["group_id"] for r in viewed_rows}
+    result = []
+    for g in groups_rows:
+        with closing(db()) as c:
+            card_rows = c.execute(
+                "SELECT * FROM task_cards WHERE group_id=? ORDER BY sort", (g["id"],)
+            ).fetchall()
+        cards = []
+        for cr in card_rows:
+            cd = dict(cr)
+            cd["photo"] = ""
+            if cd.get("photo_file_id"):
+                try:
+                    f = await bot.get_file(cd["photo_file_id"])
+                    cd["photo"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+                except Exception:
+                    pass
+            cards.append(cd)
+        if not cards:
+            continue
+        result.append({
+            "group_id": g["id"],
+            "group_name": g["name"],
+            "viewed": g["id"] in viewed_ids,
+            "cover_photo": cards[0]["photo"] if cards else "",
+            "cards": cards,
+        })
+    return web.json_response({"groups": result})
+
+async def api_card_view(request):
+    """Отметить группу карточек как просмотренную учеником."""
+    uid = check_init_student(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=403)
+    su = get_student_by_chat(uid)
+    if not su:
+        return web.json_response({"error": "not connected"}, status=403)
+    body = await request.json()
+    group_id = body.get("group_id")
+    if not group_id:
+        return web.json_response({"error": "no group_id"}, status=400)
+    with closing(db()) as c:
+        existing = c.execute(
+            "SELECT id FROM card_views WHERE student_id=? AND group_id=?",
+            (su["student_id"], group_id)
+        ).fetchone()
+        if not existing:
+            c.execute(
+                "INSERT INTO card_views(id,student_id,group_id,viewed_at) VALUES(?,?,?,?)",
+                (new_id(), su["student_id"], group_id, int(datetime.now().timestamp()*1000))
+            )
+            c.commit()
+    return web.json_response({"ok": True})
+
+async def api_upload_photo(request):
+    """Принимает base64 фото, загружает в Telegram (себе, без показа в чате никому кроме DEV),
+    возвращает photo_file_id для сохранения в карточке."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    photo_b64 = body.get("photo")
+    if not photo_b64:
+        return web.json_response({"error": "no photo"}, status=400)
+    try:
+        raw = photo_b64.split(",", 1)[-1]
+        photo_bytes = base64.b64decode(raw)
+        msg = await bot.send_photo(
+            DEV_ID, BufferedInputFile(photo_bytes, filename="card.jpg"),
+            caption="📌 Фото для карточки сохранено"
+        )
+        photo_file_id = msg.photo[-1].file_id if msg.photo else None
+        return web.json_response({"ok": True, "photo_file_id": photo_file_id})
+    except Exception as e:
+        logging.warning("upload_photo fail: %s", e)
+        return web.json_response({"error": str(e)}, status=500)
 
 async def api_audio(request):
     """Возвращает прямую ссылку на аудио-файл по file_id."""
@@ -849,32 +1247,22 @@ async def start(m: Message):
         if not stu:
             await m.answer("Ссылка недействительна.")
             return
-        # определяем часовой пояс — спрашиваем у ученика
         existing = get_student_user(student_id)
         connect_student(student_id, m.from_user.id)
-        STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📖 Открыть задания",
                                  web_app=WebAppInfo(url=STUDENT_URL))
         ]])
+        greeting_name = (stu["greeting_name"] or "").strip() if stu["greeting_name"] else ""
+        hello = f"Здравствуйте, {greeting_name}! 🌸" if greeting_name else "Привет! 🌸"
         if not existing:
-            # новый ученик — спрашиваем часовой пояс
-            tz_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏙 Москва (UTC+3)", callback_data=f"tz_{student_id}_Europe/Moscow")],
-                [InlineKeyboardButton(text="🌆 Екатеринбург (UTC+5)", callback_data=f"tz_{student_id}_Asia/Yekaterinburg")],
-                [InlineKeyboardButton(text="🌃 Новосибирск (UTC+7)", callback_data=f"tz_{student_id}_Asia/Novosibirsk")],
-                [InlineKeyboardButton(text="🌉 Иркутск (UTC+8)", callback_data=f"tz_{student_id}_Asia/Irkutsk")],
-                [InlineKeyboardButton(text="🌁 Владивосток (UTC+10)", callback_data=f"tz_{student_id}_Asia/Vladivostok")],
-                [InlineKeyboardButton(text="🌍 Белград (UTC+2)", callback_data=f"tz_{student_id}_Europe/Belgrade")],
-                [InlineKeyboardButton(text="Другой город", callback_data=f"tz_{student_id}_ask")],
-            ])
             await m.answer(
-                f"Привет! Вы подключились к урокам сербского языка. 🌸\n\n"
-                f"Для правильной отправки уведомлений — выберите ваш часовой пояс:",
-                reply_markup=tz_kb)
+                f"{hello}\nВы подключились к урокам сербского языка.\n\n"
+                f"Открывайте задания по кнопке ниже — там же настроим часовой пояс.",
+                reply_markup=kb)
         else:
             await m.answer(
-                "Вы уже подключены! 🌸\nОткрывайте задания по кнопке ниже.",
+                f"{hello}\nОткрывайте задания по кнопке ниже.",
                 reply_markup=kb)
         return
 
@@ -904,35 +1292,6 @@ async def start(m: Message):
             "Буду присылать расписание по утрам. "
             "Открыть календарь или конструктор заданий — кнопками ниже.",
             reply_markup=kb)
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("tz_"))
-async def cb_timezone(call: CallbackQuery):
-    parts = call.data.split("_", 2)
-    student_id = parts[1]
-    tz_val = parts[2] if len(parts) > 2 else "Europe/Moscow"
-    STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📖 Открыть задания",
-                             web_app=WebAppInfo(url=STUDENT_URL))
-    ]])
-    if tz_val == "ask":
-        await call.message.edit_text(
-            "Введите название вашего города (например: Казань, Омск, Самара):\n\n"
-            "_Или просто нажмите кнопку ниже — мы определим автоматически при первом входе._",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📖 Открыть задания (определим автоматически)",
-                                     web_app=WebAppInfo(url=STUDENT_URL))
-            ]]))
-    else:
-        update_student_tz(student_id, tz_val)
-        tz_display = tz_val.split("/")[-1].replace("_", " ")
-        await call.message.edit_text(
-            f"✅ Отлично! Часовой пояс: {tz_display}\n\n"
-            f"Теперь вы будете получать уведомления в правильное время. 🌸\n"
-            f"Открывайте задания по кнопке ниже:",
-            reply_markup=kb)
-    await call.answer()
 
 async def notify_students_hour():
     """Уведомление ученикам за час до урока."""
@@ -1133,7 +1492,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=21"
 
 async def on_startup(app):
     init_db()
@@ -1154,6 +1513,7 @@ async def on_startup(app):
     sched.add_job(notify_students_day,  "cron", hour=8, minute=5)
     sched.add_job(auto_backup,   "cron", day_of_week="mon,wed,fri", hour=3, minute=0)
     sched.add_job(clean_old_markers, "cron", hour=3, minute=0)
+    sched.add_job(clean_expired_broadcasts, "cron", hour=3, minute=15)
     sched.start()
     logging.info("started, webhook -> %s", PUBLIC_URL + WEBHOOK_PATH)
 
@@ -1188,18 +1548,27 @@ def main():
     # домашние задания
     app.router.add_post("/api/homework/assign",  api_homework_assign)
     app.router.add_get("/api/homework/student",  api_homework_student)
+    app.router.add_get("/api/student/next_lesson", api_student_next_lesson)
     app.router.add_post("/api/homework/progress",api_homework_progress)
     app.router.add_get("/api/homework/results",  api_homework_results)
     app.router.add_get("/api/homework/stats",    api_homework_stats)
     app.router.add_post("/api/homework/dismiss", api_homework_dismiss)
     # ученик
     app.router.add_get("/api/student/connect",   api_student_connect)
+    app.router.add_post("/api/student/onboarding_done", api_student_onboarding_done)
     app.router.add_get("/api/student/notif",     api_student_notif)
     app.router.add_post("/api/student/notif",    api_student_notif)
     app.router.add_get("/api/students/connected",api_student_connected_list)
     app.router.add_post("/api/broadcast",        api_broadcast)
+    app.router.add_get("/api/student/messages",  api_student_messages)
     # задания
     app.router.add_post("/api/tasks/reorder",    api_tasks_reorder)
+    app.router.add_get("/api/cards",              api_cards)
+    app.router.add_post("/api/cards",             api_cards)
+    app.router.add_post("/api/cards/delete",      api_cards_delete)
+    app.router.add_get("/api/student/cards",      api_student_cards)
+    app.router.add_post("/api/cards/view",        api_card_view)
+    app.router.add_post("/api/upload_photo",      api_upload_photo)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
