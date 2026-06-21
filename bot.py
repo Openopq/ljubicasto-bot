@@ -1238,15 +1238,14 @@ def dev_menu_text():
 @dp.message(CommandStart())
 async def start(m: Message):
     args = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else ""
-    # реферальная ссылка ученика: /start s_STUDENTID
-    if args.startswith("s_"):
-        student_id = args[2:]
-        # проверяем что такой ученик есть
+    # реферальная ссылка ученика: /start STUDENTID — id всегда начинается с "s" и существует в students
+    if args:
         with closing(db()) as c:
-            stu = c.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+            stu = c.execute("SELECT * FROM students WHERE id=?", (args,)).fetchone()
         if not stu:
             await m.answer("Ссылка недействительна.")
             return
+        student_id = args
         existing = get_student_user(student_id)
         connect_student(student_id, m.from_user.id)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
