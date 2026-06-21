@@ -26,8 +26,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=22"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=21"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=24"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=24"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -109,10 +109,16 @@ def init_db():
         except Exception: pass
         try: c.execute("ALTER TABLE tasks ADD COLUMN photo_input TEXT")
         except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN lang_dir INTEGER DEFAULT 0")
+        except Exception: pass
+        try: c.execute("ALTER TABLE task_groups ADD COLUMN cover_file_id TEXT")
+        except Exception: pass
         # ---- карточки (особый уровень с фото) ----
         c.execute("""CREATE TABLE IF NOT EXISTS task_cards(
             id TEXT PRIMARY KEY, group_id TEXT, title TEXT,
             photo_file_id TEXT, audio_file_id TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
+        try: c.execute("ALTER TABLE task_cards ADD COLUMN duration_mode TEXT DEFAULT 'normal'")
+        except Exception: pass
         # ---- ученики ----
         c.execute("""CREATE TABLE IF NOT EXISTS student_users(
             student_id TEXT PRIMARY KEY,
@@ -325,8 +331,8 @@ def list_levels():
 
 def save_level(lv):
     with closing(db()) as c:
-        c.execute("INSERT OR REPLACE INTO task_levels(id,name,sort,created) VALUES(?,?,?,?)",
-                  (lv["id"], lv["name"], lv.get("sort",0), lv.get("created",0)))
+        c.execute("INSERT OR REPLACE INTO task_levels(id,name,sort,created,is_cards) VALUES(?,?,?,?,?)",
+                  (lv["id"], lv["name"], lv.get("sort",0), lv.get("created",0), 1 if lv.get("is_cards") else 0))
         c.commit()
 
 def delete_level(lid):
@@ -350,7 +356,9 @@ def list_groups(level_id=None):
 
 def save_group(g):
     with closing(db()) as c:
-        c.execute("INSERT OR REPLACE INTO task_groups(id,name,level_id,sort,created) VALUES(?,?,?,?,?)",
+        c.execute("""INSERT INTO task_groups(id,name,level_id,sort,created) VALUES(?,?,?,?,?)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                       level_id=excluded.level_id, sort=excluded.sort, created=excluded.created""",
                   (g["id"], g["name"], g.get("level_id",""), g.get("sort",0), g.get("created",0)))
         c.commit()
 
@@ -385,13 +393,14 @@ def save_task(t):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO tasks
             (id,type,word,translation,choices,correct,audio_file_id,group_id,level_id,created,
-             sort,word_comment,choice_comments,photo,photo_choice,photo_input)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             sort,word_comment,choice_comments,photo,photo_choice,photo_input,lang_dir)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (t["id"], t.get("type","choice"), t.get("word",""), t.get("translation",""),
              t.get("choices",""), t.get("correct",0), t.get("audio_file_id",""),
              t.get("group_id",""), t.get("level_id",""), t.get("created",0),
              t.get("sort",0), t.get("word_comment",""), t.get("choice_comments","[]"),
-             t.get("photo",""), t.get("photo_choice",""), t.get("photo_input","")))
+             t.get("photo",""), t.get("photo_choice",""), t.get("photo_input",""),
+             1 if t.get("lang_dir") else 0))
         c.commit()
 
 def move_task_group(task_id, new_group_id):
@@ -819,7 +828,43 @@ async def api_groups(request):
                         logging.warning("notify cards fail: %s", e)
         return web.json_response({"ok":True})
     level_id=request.query.get("level_id")
-    return web.json_response({"groups": list_groups(level_id)})
+    groups = list_groups(level_id)
+    for g in groups:
+        g["cover"] = ""
+        if g.get("cover_file_id"):
+            try:
+                f = await bot.get_file(g["cover_file_id"])
+                g["cover"] = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                pass
+    return web.json_response({"groups": groups})
+
+async def api_group_cover(request):
+    """Установить/очистить обложку группы карточек. Принимает base64 ('photo') или пусто."""
+    if check_init(request) is None:
+        return web.json_response({"error":"auth"}, status=403)
+    body = await request.json()
+    gid = body.get("group_id")
+    photo_val = body.get("photo", "")
+    file_id = ""
+    if photo_val and photo_val.startswith("data:"):
+        try:
+            raw = photo_val.split(",", 1)[-1]
+            msg = await bot.send_photo(
+                DEV_ID, BufferedInputFile(base64.b64decode(raw), filename="cover.jpg"),
+                caption="📌 Обложка группы карточек")
+            if msg.photo:
+                file_id = msg.photo[-1].file_id
+        except Exception as e:
+            logging.warning("cover upload fail: %s", e)
+            return web.json_response({"error":"upload"}, status=500)
+    elif photo_val.startswith("http"):
+        # сохранение без смены — оставляем как было
+        return web.json_response({"ok": True, "unchanged": True})
+    with closing(db()) as c:
+        c.execute("UPDATE task_groups SET cover_file_id=? WHERE id=?", (file_id, gid))
+        c.commit()
+    return web.json_response({"ok": True})
 
 async def api_delete_group(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
@@ -845,6 +890,11 @@ async def api_tasks(request):
                     body["photo"] = msg.photo[-1].file_id
             except Exception as e:
                 logging.warning("task photo upload fail: %s", e)
+        elif photo_val.startswith("http"):
+            # редактирование без смены фото: фронт прислал готовую ссылку — берём сохранённый file_id
+            with closing(db()) as c:
+                row = c.execute("SELECT photo FROM tasks WHERE id=?", (body.get("id"),)).fetchone()
+            body["photo"] = row["photo"] if row and row["photo"] else ""
         save_task(body)
         return web.json_response({"ok":True})
     group_id=request.query.get("group_id"); level_id=request.query.get("level_id")
@@ -1024,7 +1074,9 @@ async def api_student_connect(request):
 async def api_student_notif(request):
     """Получить/обновить настройки уведомлений ученика.
     Доступ либо самому ученику (по его chat_id), либо Миляне (по ALLOWED_IDS + явный student_id)."""
-    student_id_override = request.query.get("student_id")
+    body = await request.json() if request.method == "POST" else None
+    # student_id может прийти в query (GET от Миляны) или в теле POST (сохранение из календаря)
+    student_id_override = request.query.get("student_id") or (body.get("student_id") if body else None)
     su = None
     if student_id_override and check_init(request) is not None:
         # запрос от Миляны/DEV — student_id передан явно
@@ -1039,7 +1091,6 @@ async def api_student_notif(request):
     if not su:
         return web.json_response({"error": "not connected"}, status=403)
     if request.method == "POST":
-        body = await request.json()
         body_student_id = body.get("student_id") or target_student_id
         update_student_notif(
             body_student_id,
@@ -1162,19 +1213,48 @@ async def api_tasks_reorder(request):
         c.commit()
     return web.json_response({"ok": True})
 
+async def api_cards_reorder(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    with closing(db()) as c:
+        for idx, cid in enumerate(body.get("ids", [])):
+            c.execute("UPDATE task_cards SET sort=? WHERE id=?", (idx, cid))
+        c.commit()
+    return web.json_response({"ok": True})
+
 async def api_cards(request):
     """CRUD для карточек (раздел «Карточки»)."""
     if check_init(request) is None:
         return web.json_response({"error": "auth"}, status=403)
     if request.method == "POST":
         body = await request.json()
+        # если фото пришло как base64 — конвертируем в Telegram file_id (как у заданий)
+        photo_val = body.get("photo", "")
+        if not body.get("photo_file_id") and photo_val and photo_val.startswith("data:"):
+            try:
+                raw = photo_val.split(",", 1)[-1]
+                photo_bytes = base64.b64decode(raw)
+                msg = await bot.send_photo(
+                    DEV_ID, BufferedInputFile(photo_bytes, filename="card.jpg"),
+                    caption="📌 Фото карточки сохранено"
+                )
+                if msg.photo:
+                    body["photo"] = msg.photo[-1].file_id
+            except Exception as e:
+                logging.warning("card photo upload fail: %s", e)
+        elif photo_val.startswith("http"):
+            with closing(db()) as c:
+                row = c.execute("SELECT photo_file_id FROM task_cards WHERE id=?", (body.get("id"),)).fetchone()
+            body["photo"] = row["photo_file_id"] if row and row["photo_file_id"] else ""
         with closing(db()) as c:
             c.execute("""INSERT OR REPLACE INTO task_cards
-                (id,group_id,title,photo_file_id,audio_file_id,sort,created)
-                VALUES(?,?,?,?,?,?,?)""",
+                (id,group_id,title,photo_file_id,audio_file_id,sort,created,duration_mode)
+                VALUES(?,?,?,?,?,?,?,?)""",
                 (body.get("id"), body.get("group_id"), body.get("title",""),
                  body.get("photo_file_id") or body.get("photo",""),
-                 body.get("audio_file_id",""), body.get("sort",0), body.get("created") or 0))
+                 body.get("audio_file_id",""), body.get("sort",0), body.get("created") or 0,
+                 body.get("duration_mode") or "normal"))
             c.commit()
         return web.json_response({"ok": True})
     group_id = request.query.get("group_id")
@@ -1243,11 +1323,18 @@ async def api_student_cards(request):
             cards.append(cd)
         if not cards:
             continue
+        cover = ""
+        if g["cover_file_id"]:
+            try:
+                f = await bot.get_file(g["cover_file_id"])
+                cover = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+            except Exception:
+                pass
         result.append({
             "group_id": g["id"],
             "group_name": g["name"],
             "viewed": g["id"] in viewed_ids,
-            "cover_photo": cards[0]["photo"] if cards else "",
+            "cover_photo": cover or (cards[0]["photo"] if cards else ""),
             "cards": cards,
         })
     return web.json_response({"groups": result})
@@ -1594,7 +1681,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=21"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=24"
 
 async def on_startup(app):
     init_db()
@@ -1621,7 +1708,7 @@ async def on_startup(app):
 
 def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-    app = web.Application(middlewares=[cors])
+    app = web.Application(middlewares=[cors], client_max_size=30 * 1024 * 1024)
     app.router.add_get("/",                      health)
     app.router.add_get("/api/day",               api_day)
     app.router.add_post("/api/day",              api_save_day)
@@ -1645,6 +1732,7 @@ def main():
     app.router.add_get("/api/groups",            api_groups)
     app.router.add_post("/api/groups",           api_groups)
     app.router.add_post("/api/groups/delete",    api_delete_group)
+    app.router.add_post("/api/groups/cover",     api_group_cover)
     app.router.add_get("/api/tasks",             api_tasks)
     app.router.add_post("/api/tasks",            api_tasks)
     app.router.add_post("/api/tasks/delete",     api_delete_task)
@@ -1672,6 +1760,7 @@ def main():
     app.router.add_get("/api/cards",              api_cards)
     app.router.add_post("/api/cards",             api_cards)
     app.router.add_post("/api/cards/delete",      api_cards_delete)
+    app.router.add_post("/api/cards/reorder",     api_cards_reorder)
     app.router.add_get("/api/student/cards",      api_student_cards)
     app.router.add_post("/api/cards/view",        api_card_view)
     app.router.add_post("/api/upload_photo",      api_upload_photo)
