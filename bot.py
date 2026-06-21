@@ -7,6 +7,7 @@ Ljubičasto — бэкенд календаря репетитора.
 
 import os
 import sqlite3
+import secrets as _secrets
 import logging
 import base64
 import io
@@ -18,14 +19,14 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import (Message, InlineKeyboardMarkup,
                            InlineKeyboardButton, WebAppInfo, FSInputFile, BotCommand,
-                           CallbackQuery, BufferedInputFile)
+                           CallbackQuery, BufferedInputFile, MenuButtonWebApp)
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=21"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=22"
 STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=21"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
@@ -79,6 +80,12 @@ def init_db():
         except Exception: pass
         try: c.execute("ALTER TABLE students ADD COLUMN greeting_name TEXT")
         except Exception: pass
+        try: c.execute("ALTER TABLE students ADD COLUMN hidden_from_stats INTEGER DEFAULT 0")
+        except Exception: pass
+        # ---- одноразовые токены реферальной ссылки ----
+        c.execute("""CREATE TABLE IF NOT EXISTS connect_tokens(
+            token TEXT PRIMARY KEY, student_id TEXT, created INTEGER,
+            used INTEGER DEFAULT 0, used_at INTEGER)""")
         # ---- конструктор заданий ----
         c.execute("""CREATE TABLE IF NOT EXISTS task_levels(
             id TEXT PRIMARY KEY, name TEXT, sort INTEGER DEFAULT 0, created INTEGER)""")
@@ -292,8 +299,23 @@ def delete_student(sid):
         c.commit()
 
 def delete_student_forever(sid):
+    """Полное удаление ученика и всех связанных с ним данных (Telegram-подключение, прогресс, токены)."""
     with closing(db()) as c:
         c.execute("DELETE FROM students WHERE id=?", (sid,))
+        c.execute("DELETE FROM student_users WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM card_views WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM assigned_tasks WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM task_progress WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM homework_results WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM broadcast_messages WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM connect_tokens WHERE student_id=?", (sid,))
+        c.commit()
+
+def hide_student_from_stats(sid):
+    """Скрывает ученика из счётчиков статистики (активных/всего), не трогая данные —
+    уроки, доход и сама карточка ученика остаются целыми."""
+    with closing(db()) as c:
+        c.execute("UPDATE students SET hidden_from_stats=1 WHERE id=?", (sid,))
         c.commit()
 
 # ---- конструктор заданий ----
@@ -412,6 +434,12 @@ def get_history_mode():
 def set_history_mode(on: bool):
     set_setting("history_mode", "1" if on else "0")
 
+def get_dev_mode():
+    return get_setting("dev_mode", "0") == "1"
+
+def set_dev_mode(on: bool):
+    set_setting("dev_mode", "1" if on else "0")
+
 def db_stats():
     with closing(db()) as c:
         students = c.execute("SELECT COUNT(*) FROM students WHERE archived=0").fetchone()[0]
@@ -487,6 +515,32 @@ def get_student_user(student_id):
     with closing(db()) as c:
         row = c.execute("SELECT * FROM student_users WHERE student_id=?", (student_id,)).fetchone()
         return dict(row) if row else None
+
+def create_connect_token(student_id):
+    """Создаёт новый одноразовый токен для подключения ученика.
+    Старые неиспользованные токены этого ученика автоматически становятся недействительными."""
+    token = _secrets.token_urlsafe(12)  # ~16 случайных URL-safe символов
+    with closing(db()) as c:
+        # инвалидируем все предыдущие неиспользованные токены этого ученика
+        c.execute("DELETE FROM connect_tokens WHERE student_id=? AND used=0", (student_id,))
+        c.execute("INSERT INTO connect_tokens(token,student_id,created,used) VALUES(?,?,?,0)",
+                  (token, student_id, int(datetime.now().timestamp()*1000)))
+        c.commit()
+    return token
+
+def resolve_connect_token(token):
+    """Возвращает student_id если токен валиден и не использован, иначе None."""
+    with closing(db()) as c:
+        row = c.execute("SELECT * FROM connect_tokens WHERE token=?", (token,)).fetchone()
+        if not row or row["used"]:
+            return None
+        return row["student_id"]
+
+def mark_token_used(token):
+    with closing(db()) as c:
+        c.execute("UPDATE connect_tokens SET used=1, used_at=? WHERE token=?",
+                  (int(datetime.now().timestamp()*1000), token))
+        c.commit()
 
 def connect_student(student_id, chat_id, timezone="Europe/Moscow"):
     with closing(db()) as c:
@@ -670,6 +724,14 @@ async def api_delete_student(request):
     delete_student(body.get("id"))
     return web.json_response({"ok": True})
 
+async def api_hide_student_from_stats(request):
+    """Скрывает ученика из счётчиков статистики (без удаления данных)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    hide_student_from_stats(body.get("id"))
+    return web.json_response({"ok": True})
+
 async def api_delete_student_forever(request):
     if check_init(request) is None:
         return web.json_response({"error": "auth"}, status=403)
@@ -688,6 +750,18 @@ async def api_history_set(request):
     body = await request.json()
     set_history_mode(bool(body.get("on", False)))
     return web.json_response({"ok": True, "history": get_history_mode()})
+
+async def api_dev_mode(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    return web.json_response({"dev_mode": get_dev_mode()})
+
+async def api_dev_mode_set(request):
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    set_dev_mode(bool(body.get("on", False)))
+    return web.json_response({"ok": True, "dev_mode": get_dev_mode()})
 
 async def api_notify(request):
     """Возвращает персональные настройки уведомлений."""
@@ -919,6 +993,23 @@ async def api_student_onboarding_done(request):
         c.execute("UPDATE student_users SET onboarding_done=1 WHERE student_id=?", (su["student_id"],))
         c.commit()
     return web.json_response({"ok": True})
+
+async def api_gen_connect_link(request):
+    """Генерирует новую одноразовую ссылку подключения для ученика (вызывается Миляной из карточки)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    student_id = body.get("student_id")
+    if not student_id:
+        return web.json_response({"error": "no student_id"}, status=400)
+    with closing(db()) as c:
+        stu = c.execute("SELECT id FROM students WHERE id=?", (student_id,)).fetchone()
+    if not stu:
+        return web.json_response({"error": "student not found"}, status=404)
+    token = create_connect_token(student_id)
+    bot_username = (await bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={token}"
+    return web.json_response({"link": link, "token": token})
 
 async def api_student_connect(request):
     """Проверка подключения ученика и обновление настроек."""
@@ -1238,16 +1329,28 @@ def dev_menu_text():
 @dp.message(CommandStart())
 async def start(m: Message):
     args = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else ""
-    # реферальная ссылка ученика: /start STUDENTID — id всегда начинается с "s" и существует в students
+    # реферальная ссылка ученика: /start TOKEN — одноразовый токен, сгенерированный в карточке ученика
     if args:
+        student_id = resolve_connect_token(args)
+        if not student_id:
+            await m.answer("Ссылка недействительна или уже использована. Попросите Миляну выслать новую ссылку.")
+            return
         with closing(db()) as c:
-            stu = c.execute("SELECT * FROM students WHERE id=?", (args,)).fetchone()
+            stu = c.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
         if not stu:
             await m.answer("Ссылка недействительна.")
             return
-        student_id = args
         existing = get_student_user(student_id)
         connect_student(student_id, m.from_user.id)
+        mark_token_used(args)
+        # персональная кнопка меню "Задания" вместо общей "Расписание" — только для этого ученика
+        try:
+            await bot.set_chat_menu_button(
+                chat_id=m.from_user.id,
+                menu_button=MenuButtonWebApp(text="Задания", web_app=WebAppInfo(url=STUDENT_URL))
+            )
+        except Exception as e:
+            logging.warning("set_chat_menu_button fail for student %s: %s", student_id, e)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📖 Открыть задания",
                                  web_app=WebAppInfo(url=STUDENT_URL))
@@ -1257,7 +1360,7 @@ async def start(m: Message):
         if not existing:
             await m.answer(
                 f"{hello}\nВы подключились к урокам сербского языка.\n\n"
-                f"Открывайте задания по кнопке ниже — там же настроим часовой пояс.",
+                f"Открывайте задания по кнопке ниже.",
                 reply_markup=kb)
         else:
             await m.answer(
@@ -1528,8 +1631,11 @@ def main():
     app.router.add_post("/api/students",         api_save_student)
     app.router.add_post("/api/students/delete",         api_delete_student)
     app.router.add_post("/api/students/delete-forever",  api_delete_student_forever)
+    app.router.add_post("/api/students/hide-from-stats",  api_hide_student_from_stats)
     app.router.add_get("/api/history",           api_history)
     app.router.add_post("/api/history/set",      api_history_set)
+    app.router.add_get("/api/dev_mode",          api_dev_mode)
+    app.router.add_post("/api/dev_mode/set",     api_dev_mode_set)
     app.router.add_get("/api/notify",            api_notify)
     app.router.add_post("/api/notify/set",       api_notify_set)
     # конструктор заданий
@@ -1554,6 +1660,7 @@ def main():
     app.router.add_post("/api/homework/dismiss", api_homework_dismiss)
     # ученик
     app.router.add_get("/api/student/connect",   api_student_connect)
+    app.router.add_post("/api/gen_connect_link",  api_gen_connect_link)
     app.router.add_post("/api/student/onboarding_done", api_student_onboarding_done)
     app.router.add_get("/api/student/notif",     api_student_notif)
     app.router.add_post("/api/student/notif",    api_student_notif)
