@@ -26,8 +26,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=24"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=24"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=25"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=25"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -41,6 +41,24 @@ logging.basicConfig(level=logging.INFO)
 tz = pytz.timezone(TZ)
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher()
+
+async def get_photo_file_id(photo_bytes, filename="img.jpg"):
+    """Загружает фото в Telegram и возвращает file_id, НЕ оставляя видимых сообщений
+    (отправляет себе без звука и сразу удаляет)."""
+    try:
+        msg = await bot.send_photo(
+            DEV_ID, BufferedInputFile(photo_bytes, filename=filename),
+            disable_notification=True
+        )
+        fid = msg.photo[-1].file_id if msg.photo else None
+        try:
+            await bot.delete_message(DEV_ID, msg.message_id)
+        except Exception:
+            pass
+        return fid
+    except Exception as e:
+        logging.warning("get_photo_file_id fail: %s", e)
+        return None
 
 # ---------------------- DB ----------------------
 def db():
@@ -148,6 +166,12 @@ def init_db():
             group_id TEXT,
             assigned_at INTEGER,
             status TEXT DEFAULT 'pending')""")
+        # ---- назначенные ученику группы карточек ----
+        c.execute("""CREATE TABLE IF NOT EXISTS assigned_cards(
+            id TEXT PRIMARY KEY,
+            student_id TEXT,
+            group_id TEXT,
+            assigned_at INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS task_progress(
             id TEXT PRIMARY KEY,
             student_id TEXT,
@@ -310,6 +334,7 @@ def delete_student_forever(sid):
         c.execute("DELETE FROM students WHERE id=?", (sid,))
         c.execute("DELETE FROM student_users WHERE student_id=?", (sid,))
         c.execute("DELETE FROM card_views WHERE student_id=?", (sid,))
+        c.execute("DELETE FROM assigned_cards WHERE student_id=?", (sid,))
         c.execute("DELETE FROM assigned_tasks WHERE student_id=?", (sid,))
         c.execute("DELETE FROM task_progress WHERE student_id=?", (sid,))
         c.execute("DELETE FROM homework_results WHERE student_id=?", (sid,))
@@ -809,23 +834,8 @@ async def api_groups(request):
     if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
     if request.method=="POST":
         body = await request.json()
-        with closing(db()) as c:
-            is_new = c.execute("SELECT 1 FROM task_groups WHERE id=?", (body.get("id"),)).fetchone() is None
         save_group(body)
-        # уведомляем подключённых учеников о новой группе карточек (не о заданиях — те назначаются персонально)
-        if is_new:
-            with closing(db()) as c:
-                lvl = c.execute("SELECT is_cards FROM task_levels WHERE id=?", (body.get("level_id"),)).fetchone()
-            if lvl and lvl["is_cards"]:
-                with closing(db()) as c:
-                    students = c.execute(
-                        "SELECT chat_id FROM student_users WHERE notif_cards=1 AND chat_id IS NOT NULL"
-                    ).fetchall()
-                for s in students:
-                    try:
-                        await bot.send_message(s["chat_id"], f"🖼 Новые карточки: «{body.get('name','')}»")
-                    except Exception as e:
-                        logging.warning("notify cards fail: %s", e)
+        # уведомления при создании пустой группы НЕ шлём — это делается позже, при назначении ученику
         return web.json_response({"ok":True})
     level_id=request.query.get("level_id")
     groups = list_groups(level_id)
@@ -848,15 +858,8 @@ async def api_group_cover(request):
     photo_val = body.get("photo", "")
     file_id = ""
     if photo_val and photo_val.startswith("data:"):
-        try:
-            raw = photo_val.split(",", 1)[-1]
-            msg = await bot.send_photo(
-                DEV_ID, BufferedInputFile(base64.b64decode(raw), filename="cover.jpg"),
-                caption="📌 Обложка группы карточек")
-            if msg.photo:
-                file_id = msg.photo[-1].file_id
-        except Exception as e:
-            logging.warning("cover upload fail: %s", e)
+        file_id = await get_photo_file_id(base64.b64decode(photo_val.split(",", 1)[-1]), "cover.jpg")
+        if not file_id:
             return web.json_response({"error":"upload"}, status=500)
     elif photo_val.startswith("http"):
         # сохранение без смены — оставляем как было
@@ -879,17 +882,9 @@ async def api_tasks(request):
         # если фото пришло как base64 — конвертируем в Telegram file_id, чтобы не раздувать базу
         photo_val = body.get("photo", "")
         if photo_val and photo_val.startswith("data:"):
-            try:
-                raw = photo_val.split(",", 1)[-1]
-                photo_bytes = base64.b64decode(raw)
-                msg = await bot.send_photo(
-                    DEV_ID, BufferedInputFile(photo_bytes, filename="task.jpg"),
-                    caption="📌 Фото для задания сохранено"
-                )
-                if msg.photo:
-                    body["photo"] = msg.photo[-1].file_id
-            except Exception as e:
-                logging.warning("task photo upload fail: %s", e)
+            fid = await get_photo_file_id(base64.b64decode(photo_val.split(",", 1)[-1]), "task.jpg")
+            if fid:
+                body["photo"] = fid
         elif photo_val.startswith("http"):
             # редактирование без смены фото: фронт прислал готовую ссылку — берём сохранённый file_id
             with closing(db()) as c:
@@ -939,6 +934,34 @@ async def api_homework_assign(request):
                 "📚 Вам пришло домашнее задание!")
         except Exception as e:
             logging.warning("notify student fail: %s", e)
+    return web.json_response({"ok": True})
+
+async def api_cards_assign(request):
+    """Отправить ученику группы карточек. Только для Миляны."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    student_id = body.get("student_id")
+    group_ids = body.get("group_ids", [])
+    if not student_id or not group_ids:
+        return web.json_response({"error": "missing fields"}, status=400)
+    now = int(datetime.now().timestamp() * 1000)
+    with closing(db()) as c:
+        for gid in group_ids:
+            exists = c.execute(
+                "SELECT 1 FROM assigned_cards WHERE student_id=? AND group_id=?",
+                (student_id, gid)).fetchone()
+            if not exists:
+                c.execute("INSERT INTO assigned_cards(id,student_id,group_id,assigned_at) VALUES(?,?,?,?)",
+                          (new_id(), student_id, gid, now))
+        c.commit()
+    # короткое уведомление в чат, если включены «Новые карточки»
+    su = get_student_user(student_id)
+    if su and su.get("chat_id") and su.get("notif_cards", 1):
+        try:
+            await bot.send_message(su["chat_id"], "🖼 Появились новые карточки — загляни в приложение")
+        except Exception as e:
+            logging.warning("notify cards assign fail: %s", e)
     return web.json_response({"ok": True})
 
 async def api_student_next_lesson(request):
@@ -1133,6 +1156,10 @@ async def api_broadcast(request):
     expires_at = None if ttl_days is None else int(datetime.now().timestamp() * 1000) + ttl_days * 86400 * 1000
     if not (text or photo_b64) or not student_ids:
         return web.json_response({"error": "missing fields"}, status=400)
+    # фото поста одно на всех — загружаем один раз тихо, без видимого сообщения
+    photo_file_id = None
+    if photo_b64:
+        photo_file_id = await get_photo_file_id(base64.b64decode(photo_b64.split(",", 1)[-1]), "post.jpg")
     sent, failed = 0, 0
     for sid in student_ids:
         su = get_student_user(sid)
@@ -1140,38 +1167,16 @@ async def api_broadcast(request):
             failed += 1
             continue
         try:
-            photo_file_id = None
-            caption = f"🌸 {text}" if text else None
-            wants_chat_msg = su.get("notif_posts", 1) == 1
-            if photo_b64:
-                raw = photo_b64.split(",", 1)[-1]
-                photo_bytes = base64.b64decode(raw)
-                if wants_chat_msg:
-                    msg = await bot.send_photo(
-                        su["chat_id"], BufferedInputFile(photo_bytes, filename="broadcast.jpg"),
-                        caption=caption, parse_mode="HTML" if is_html else None
-                    )
-                    if msg.photo:
-                        photo_file_id = msg.photo[-1].file_id
-                else:
-                    # не шлём в чат, но всё равно нужен file_id для отображения в приложении —
-                    # отправляем себе (DEV) тихо, чтобы получить file_id без уведомления ученика
-                    msg = await bot.send_photo(
-                        DEV_ID, BufferedInputFile(photo_bytes, filename="broadcast.jpg"),
-                        caption="📌 фото поста (тихая рассылка)"
-                    )
-                    if msg.photo:
-                        photo_file_id = msg.photo[-1].file_id
-            else:
-                if wants_chat_msg:
-                    await bot.send_message(su["chat_id"], caption, parse_mode="HTML" if is_html else None)
-            sent += 1
-            # сохраняем в историю сообщений ученика
+            # сам пост (фото + текст) кладём в приложение — карусель сообщений
             with closing(db()) as c:
                 c.execute("""INSERT INTO broadcast_messages(id,student_id,text,photo_file_id,sent_at,expires_at)
                     VALUES(?,?,?,?,?,?)""",
                     (new_id(), sid, text, photo_file_id, int(datetime.now().timestamp()*1000), expires_at))
                 c.commit()
+            # в чат — только короткое уведомление, если включены «Новые посты»
+            if su.get("notif_posts", 1) == 1:
+                await bot.send_message(su["chat_id"], "📭 Появился новый пост — загляни в приложение")
+            sent += 1
         except Exception as e:
             logging.warning("broadcast fail %s: %s", sid, e)
             failed += 1
@@ -1232,17 +1237,9 @@ async def api_cards(request):
         # если фото пришло как base64 — конвертируем в Telegram file_id (как у заданий)
         photo_val = body.get("photo", "")
         if not body.get("photo_file_id") and photo_val and photo_val.startswith("data:"):
-            try:
-                raw = photo_val.split(",", 1)[-1]
-                photo_bytes = base64.b64decode(raw)
-                msg = await bot.send_photo(
-                    DEV_ID, BufferedInputFile(photo_bytes, filename="card.jpg"),
-                    caption="📌 Фото карточки сохранено"
-                )
-                if msg.photo:
-                    body["photo"] = msg.photo[-1].file_id
-            except Exception as e:
-                logging.warning("card photo upload fail: %s", e)
+            fid = await get_photo_file_id(base64.b64decode(photo_val.split(",", 1)[-1]), "card.jpg")
+            if fid:
+                body["photo"] = fid
         elif photo_val.startswith("http"):
             with closing(db()) as c:
                 row = c.execute("SELECT photo_file_id FROM task_cards WHERE id=?", (body.get("id"),)).fetchone()
@@ -1298,7 +1295,10 @@ async def api_student_cards(request):
         if not cards_level:
             return web.json_response({"groups": []})
         groups_rows = c.execute(
-            "SELECT * FROM task_groups WHERE level_id=? ORDER BY sort", (cards_level["id"],)
+            """SELECT * FROM task_groups
+               WHERE level_id=? AND id IN (SELECT group_id FROM assigned_cards WHERE student_id=?)
+               ORDER BY sort""",
+            (cards_level["id"], student_id)
         ).fetchall()
         viewed_rows = c.execute(
             "SELECT group_id FROM card_views WHERE student_id=?", (student_id,)
@@ -1375,12 +1375,7 @@ async def api_upload_photo(request):
         return web.json_response({"error": "no photo"}, status=400)
     try:
         raw = photo_b64.split(",", 1)[-1]
-        photo_bytes = base64.b64decode(raw)
-        msg = await bot.send_photo(
-            DEV_ID, BufferedInputFile(photo_bytes, filename="card.jpg"),
-            caption="📌 Фото для карточки сохранено"
-        )
-        photo_file_id = msg.photo[-1].file_id if msg.photo else None
+        photo_file_id = await get_photo_file_id(base64.b64decode(raw), "card.jpg")
         return web.json_response({"ok": True, "photo_file_id": photo_file_id})
     except Exception as e:
         logging.warning("upload_photo fail: %s", e)
@@ -1681,7 +1676,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=24"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=25"
 
 async def on_startup(app):
     init_db()
@@ -1761,6 +1756,7 @@ def main():
     app.router.add_post("/api/cards",             api_cards)
     app.router.add_post("/api/cards/delete",      api_cards_delete)
     app.router.add_post("/api/cards/reorder",     api_cards_reorder)
+    app.router.add_post("/api/cards/assign",      api_cards_assign)
     app.router.add_get("/api/student/cards",      api_student_cards)
     app.router.add_post("/api/cards/view",        api_card_view)
     app.router.add_post("/api/upload_photo",      api_upload_photo)
