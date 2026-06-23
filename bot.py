@@ -1,3 +1,10 @@
+"""
+Ljubičasto — бэкенд календаря репетитора.
+Один процесс: Telegram-бот (webhook) + HTTP API для Mini App + уведомления.
+
+Деплоится на Bothost из GitHub. Перед деплоем заполни блок CONFIG ниже.
+"""
+
 import os
 import sqlite3
 import secrets as _secrets
@@ -21,8 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=28"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=28"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=29"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=29"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -149,6 +156,8 @@ def init_db():
         try: c.execute("ALTER TABLE tasks ADD COLUMN photo_input TEXT")
         except Exception: pass
         try: c.execute("ALTER TABLE tasks ADD COLUMN lang_dir INTEGER DEFAULT 0")
+        except Exception: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN word_wrong_comment TEXT DEFAULT ''")
         except Exception: pass
         try: c.execute("ALTER TABLE task_groups ADD COLUMN cover_file_id TEXT")
         except Exception: pass
@@ -447,12 +456,13 @@ def save_task(t):
     with closing(db()) as c:
         c.execute("""INSERT OR REPLACE INTO tasks
             (id,type,word,translation,choices,correct,audio_file_id,group_id,level_id,created,
-             sort,word_comment,choice_comments,photo,photo_choice,photo_input,lang_dir)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             sort,word_comment,word_wrong_comment,choice_comments,photo,photo_choice,photo_input,lang_dir)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (t["id"], t.get("type","choice"), t.get("word",""), t.get("translation",""),
              t.get("choices",""), t.get("correct",0), t.get("audio_file_id",""),
              t.get("group_id",""), t.get("level_id",""), t.get("created",0),
-             t.get("sort",0), t.get("word_comment",""), t.get("choice_comments","[]"),
+             t.get("sort",0), t.get("word_comment",""), t.get("word_wrong_comment",""),
+             t.get("choice_comments","[]"),
              t.get("photo",""), t.get("photo_choice",""), t.get("photo_input",""),
              1 if t.get("lang_dir") else 0))
         c.commit()
@@ -681,7 +691,7 @@ def get_student_homework(student_id):
         now_ms = int(datetime.now().timestamp()*1000)
         rows = c.execute("""
             SELECT at.*, t.word, t.translation, t.type, t.choices, t.correct, t.audio_file_id,
-                   t.word_comment, t.choice_comments, t.photo, t.photo_choice, t.photo_input,
+                   t.word_comment, t.word_wrong_comment, t.choice_comments, t.photo, t.photo_choice, t.photo_input,
                    tg.name as group_name, tg.id as group_id
             FROM assigned_tasks at
             JOIN tasks t ON t.id=at.task_id
@@ -1829,7 +1839,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=28"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=29"
 
 async def on_startup(app):
     init_db()
