@@ -28,8 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=26"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=26"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=27"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=27"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -1758,8 +1758,10 @@ async def hour_reminder():
             txt = f"⏰ Через час урок — {L.get('name') or 'занятие'} в {t}."
             sep = "&" if "?" in MINIAPP_URL else "?"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Открыть расписание",
-                                     web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}"))
+                InlineKeyboardButton(text="📅 Расписание",
+                                     web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}")),
+                InlineKeyboardButton(text="🗂 Конструктор",
+                                     web_app=WebAppInfo(url=TASKS_URL))
             ]])
             for chat_id in notify_users():
                 if get_setting(f"notify_hour_{chat_id}", "1") != "1":
@@ -1782,8 +1784,10 @@ async def morning():
     text = f"Доброе утро! Сегодня занятий: {len(lessons)}\n\n" + "\n".join(lines)
     sep  = "&" if "?" in MINIAPP_URL else "?"
     kb   = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Открыть расписание",
-                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}"))
+        InlineKeyboardButton(text="📅 Расписание",
+                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}")),
+        InlineKeyboardButton(text="🗂 Конструктор",
+                             web_app=WebAppInfo(url=TASKS_URL))
     ]])
     for chat_id in notify_users():
         if get_setting(f"notify_morning_{chat_id}", "1") != "1":
@@ -1805,8 +1809,10 @@ async def evening():
     text = f"Завтра занятий: {len(lessons)}\n\n" + "\n".join(lines)
     sep  = "&" if "?" in MINIAPP_URL else "?"
     kb   = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Открыть расписание",
-                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={tomorrow}"))
+        InlineKeyboardButton(text="📅 Расписание",
+                             web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={tomorrow}")),
+        InlineKeyboardButton(text="🗂 Конструктор",
+                             web_app=WebAppInfo(url=TASKS_URL))
     ]])
     for chat_id in notify_users():
         if get_setting(f"notify_evening_{chat_id}", "0") != "1":
@@ -1830,7 +1836,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=26"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=27"
 
 async def on_startup(app):
     init_db()
