@@ -8,6 +8,7 @@ Ljubičasto — бэкенд календаря репетитора.
 import os
 import sqlite3
 import secrets as _secrets
+import random
 import logging
 import base64
 import io
@@ -26,8 +27,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=25"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=25"
+STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=26"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=26"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -42,20 +44,46 @@ tz = pytz.timezone(TZ)
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher()
 
+# ---- тексты уведомлений (5 вариантов на каждый тип) ----
+_NOTIF_HOMEWORK = [
+    "📚 Вам пришло домашнее задание — загляните в приложение!",
+    "📚 Новое задание ждёт вас в приложении",
+    "📚 Задание готово — откройте приложение, чтобы начать",
+    "📚 Я отправила вам задание",
+    "📚 Есть новое задание — не забудьте выполнить!",
+]
+_NOTIF_CARDS = [
+    "🎴 Появились новые карточки — загляните в приложение!",
+    "🎴 Я добавила новые карточки для вас",
+    "🎴 Новые карточки уже в приложении",
+    "🎴 Пришли новые карточки — откройте приложение",
+    "🎴 Я подготовила для вас новые карточки!",
+]
+_NOTIF_POSTS = [
+    "📬 Появился новый пост — загляните в приложение!",
+    "📬 Я написала для вас новый пост",
+    "📬 Для вас есть новый пост в приложении",
+    "📬 Новый пост ждёт вас в приложении",
+    "📬 Я опубликовала для вас новый пост — откройте приложение",
+]
+
+def rand_notif(variants): return random.choice(variants)
+
+def _open_app_kb():
+    """Кнопка перехода в приложение ученика под уведомлением."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть приложение",
+                             web_app=WebAppInfo(url=STUDENT_URL))
+    ]])
+
 async def get_photo_file_id(photo_bytes, filename="img.jpg"):
-    """Загружает фото в Telegram и возвращает file_id, НЕ оставляя видимых сообщений
-    (отправляет себе без звука и сразу удаляет)."""
+    """Загружает фото в канал-хранилище и возвращает file_id — без мелькания в личном чате."""
     try:
         msg = await bot.send_photo(
-            DEV_ID, BufferedInputFile(photo_bytes, filename=filename),
+            STORAGE_CHANNEL, BufferedInputFile(photo_bytes, filename=filename),
             disable_notification=True
         )
-        fid = msg.photo[-1].file_id if msg.photo else None
-        try:
-            await bot.delete_message(DEV_ID, msg.message_id)
-        except Exception:
-            pass
-        return fid
+        return msg.photo[-1].file_id if msg.photo else None
     except Exception as e:
         logging.warning("get_photo_file_id fail: %s", e)
         return None
@@ -195,6 +223,14 @@ def init_db():
             sent_at INTEGER,
             expires_at INTEGER)""")
         try: c.execute("ALTER TABLE broadcast_messages ADD COLUMN expires_at INTEGER")
+        except Exception: pass
+        try: c.execute("ALTER TABLE assigned_tasks ADD COLUMN expires_at INTEGER")
+        except Exception: pass
+        try: c.execute("ALTER TABLE assigned_cards ADD COLUMN expires_at INTEGER")
+        except Exception: pass
+        try: c.execute("ALTER TABLE assigned_tasks ADD COLUMN expired INTEGER DEFAULT 0")
+        except Exception: pass
+        try: c.execute("ALTER TABLE assigned_cards ADD COLUMN expired INTEGER DEFAULT 0")
         except Exception: pass
         c.commit()
 
@@ -483,12 +519,35 @@ def db_stats():
     return students, lessons, markers, size_kb
 
 def clean_expired_broadcasts():
-    """Удаляем из базы рассылки, у которых истёк срок жизни (>7 дней после expires_at — на всякий случай)."""
-    cutoff = int(datetime.now().timestamp() * 1000) - 7 * 86400 * 1000
+    """Помечаем просроченные ДЗ/карточки флагом expired (остаются для метки «Отправлено» серым).
+    Рассылки и совсем старые записи (>90 дней) удаляем физически."""
+    now = int(datetime.now().timestamp() * 1000)
+    cutoff_bc = now - 7 * 86400 * 1000        # посты чистим через 7 дней после истечения
+    cutoff_old = now - 90 * 86400 * 1000      # ДЗ/карточки физически — старше 90 дней после истечения
     with closing(db()) as c:
         c.execute("""DELETE FROM broadcast_messages
-            WHERE expires_at IS NOT NULL AND expires_at < ?""", (cutoff,))
+            WHERE expires_at IS NOT NULL AND expires_at < ?""", (cutoff_bc,))
+        # помечаем истёкшие (но ещё «свежие») как expired — у ученика они уже не показываются,
+        # но в списке отправки видны серым «Отправлено»
+        c.execute("UPDATE assigned_tasks SET expired=1 WHERE expires_at IS NOT NULL AND expires_at < ? AND expired=0", (now,))
+        c.execute("UPDATE assigned_cards SET expired=1 WHERE expires_at IS NOT NULL AND expires_at < ? AND expired=0", (now,))
+        # физически удаляем совсем старые
+        c.execute("DELETE FROM assigned_tasks WHERE expires_at IS NOT NULL AND expires_at < ?", (cutoff_old,))
+        c.execute("DELETE FROM assigned_cards WHERE expires_at IS NOT NULL AND expires_at < ?", (cutoff_old,))
         c.commit()
+
+def cleanup_old_assignments(days=90):
+    """Ручная чистка: физически удалить ДЗ/карточки старше N дней после истечения. Возвращает (tasks, cards)."""
+    cutoff = int(datetime.now().timestamp() * 1000) - days * 86400 * 1000
+    with closing(db()) as c:
+        # сначала прогресс удаляемых заданий
+        old = c.execute("SELECT id FROM assigned_tasks WHERE expires_at IS NOT NULL AND expires_at < ?", (cutoff,)).fetchall()
+        for r in old:
+            c.execute("DELETE FROM task_progress WHERE assigned_id=?", (r["id"],))
+        t = c.execute("DELETE FROM assigned_tasks WHERE expires_at IS NOT NULL AND expires_at < ?", (cutoff,)).rowcount
+        cc = c.execute("DELETE FROM assigned_cards WHERE expires_at IS NOT NULL AND expires_at < ?", (cutoff,)).rowcount
+        c.commit()
+        return t, cc
 
 def clean_old_markers():
     """Удаляем маркеры напоминаний для уроков, дата которых уже прошла (>2 дней назад)."""
@@ -607,17 +666,26 @@ def update_student_notif(student_id, homework=None, hour=None, day=None, cards=N
 import uuid as _uuid
 def new_id(): return _uuid.uuid4().hex
 
-def assign_homework(student_id, task_ids, group_id):
+def assign_homework(student_id, task_ids, group_id, expires_at=None):
     with closing(db()) as c:
         now = int(datetime.now().timestamp()*1000)
+        # переназначение той же группы: убираем старые записи и их прогресс,
+        # чтобы у ученика была одна актуальная версия и чистая статистика
+        old = c.execute("SELECT id FROM assigned_tasks WHERE student_id=? AND group_id=?",
+                        (student_id, group_id)).fetchall()
+        for r in old:
+            c.execute("DELETE FROM task_progress WHERE assigned_id=?", (r["id"],))
+        c.execute("DELETE FROM assigned_tasks WHERE student_id=? AND group_id=?",
+                  (student_id, group_id))
         for tid in task_ids:
-            c.execute("""INSERT INTO assigned_tasks(id,student_id,task_id,group_id,assigned_at,status)
-                VALUES(?,?,?,?,?,'pending')""",
-                (new_id(), student_id, tid, group_id, now))
+            c.execute("""INSERT INTO assigned_tasks(id,student_id,task_id,group_id,assigned_at,status,expires_at,expired)
+                VALUES(?,?,?,?,?,'pending',?,0)""",
+                (new_id(), student_id, tid, group_id, now, expires_at))
         c.commit()
 
 def get_student_homework(student_id):
     with closing(db()) as c:
+        now_ms = int(datetime.now().timestamp()*1000)
         rows = c.execute("""
             SELECT at.*, t.word, t.translation, t.type, t.choices, t.correct, t.audio_file_id,
                    t.word_comment, t.choice_comments, t.photo, t.photo_choice, t.photo_input,
@@ -626,10 +694,11 @@ def get_student_homework(student_id):
             JOIN tasks t ON t.id=at.task_id
             JOIN task_groups tg ON tg.id=at.group_id
             WHERE at.student_id=?
-            ORDER BY at.assigned_at, at.id""", (student_id,)).fetchall()
+              AND (at.expires_at IS NULL OR at.expires_at > ?)
+            ORDER BY at.assigned_at, at.id""", (student_id, now_ms)).fetchall()
         return [dict(r) for r in rows]
 
-def save_progress(student_id, task_id, assigned_id, is_correct, input_value=""):
+def save_progress(student_id, task_id, assigned_id, is_correct, input_value="", done=False):
     with closing(db()) as c:
         # считаем попытку
         attempt = c.execute("""SELECT COUNT(*) FROM task_progress
@@ -639,8 +708,8 @@ def save_progress(student_id, task_id, assigned_id, is_correct, input_value=""):
             VALUES(?,?,?,?,?,?,?,?)""",
             (new_id(), student_id, task_id, assigned_id, attempt,
              1 if is_correct else 0, input_value, int(datetime.now().timestamp()*1000)))
-        # если правильно — помечаем assigned_task как done
-        if is_correct:
+        # задание считается пройденным при правильном ИЛИ финальном ответе (пропуск/выбор)
+        if is_correct or done:
             c.execute("UPDATE assigned_tasks SET status='done' WHERE id=?", (assigned_id,))
         c.commit()
 
@@ -923,17 +992,13 @@ async def api_homework_assign(request):
     student_id = body.get("student_id")
     task_ids = body.get("task_ids", [])
     group_id = body.get("group_id")
+    ttl_days = body.get("ttl_days")
     if not student_id or not task_ids:
         return web.json_response({"error": "missing fields"}, status=400)
-    assign_homework(student_id, task_ids, group_id)
-    # уведомление ученику
-    su = get_student_user(student_id)
-    if su and su.get("chat_id") and su.get("notif_homework", 1):
-        try:
-            await bot.send_message(su["chat_id"],
-                "📚 Вам пришло домашнее задание!")
-        except Exception as e:
-            logging.warning("notify student fail: %s", e)
+    expires_at = None
+    if ttl_days is not None:
+        expires_at = int(datetime.now().timestamp()*1000) + int(ttl_days) * 86400 * 1000
+    assign_homework(student_id, task_ids, group_id, expires_at)
     return web.json_response({"ok": True})
 
 async def api_cards_assign(request):
@@ -943,25 +1008,75 @@ async def api_cards_assign(request):
     body = await request.json()
     student_id = body.get("student_id")
     group_ids = body.get("group_ids", [])
+    ttl_days = body.get("ttl_days")
     if not student_id or not group_ids:
         return web.json_response({"error": "missing fields"}, status=400)
     now = int(datetime.now().timestamp() * 1000)
+    expires_at = None
+    if ttl_days is not None:
+        expires_at = now + int(ttl_days) * 86400 * 1000
     with closing(db()) as c:
         for gid in group_ids:
             exists = c.execute(
-                "SELECT 1 FROM assigned_cards WHERE student_id=? AND group_id=?",
+                "SELECT id FROM assigned_cards WHERE student_id=? AND group_id=?",
                 (student_id, gid)).fetchone()
-            if not exists:
-                c.execute("INSERT INTO assigned_cards(id,student_id,group_id,assigned_at) VALUES(?,?,?,?)",
-                          (new_id(), student_id, gid, now))
+            if exists:
+                # переотправка той же группы — обновляем срок, снимаем expired, чистим просмотры
+                c.execute("UPDATE assigned_cards SET assigned_at=?, expires_at=?, expired=0 WHERE id=?",
+                          (now, expires_at, exists["id"]))
+                c.execute("DELETE FROM card_views WHERE student_id=? AND group_id=?", (student_id, gid))
+            else:
+                c.execute("INSERT INTO assigned_cards(id,student_id,group_id,assigned_at,expires_at,expired) VALUES(?,?,?,?,?,0)",
+                          (new_id(), student_id, gid, now, expires_at))
         c.commit()
-    # короткое уведомление в чат, если включены «Новые карточки»
+    return web.json_response({"ok": True})
+
+async def api_homework_assigned(request):
+    """Что уже отправлено ученику: group_id -> 'active' | 'expired'. Для пометок на экране отправки."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    student_id = request.query.get("student_id")
+    if not student_id:
+        return web.json_response({"error": "missing student_id"}, status=400)
+    now = int(datetime.now().timestamp() * 1000)
+    tasks_map, cards_map = {}, {}
+    with closing(db()) as c:
+        for r in c.execute("SELECT group_id, expires_at, expired FROM assigned_tasks WHERE student_id=?", (student_id,)).fetchall():
+            active = (r["expired"] == 0) and (r["expires_at"] is None or r["expires_at"] > now)
+            st = 'active' if active else 'expired'
+            if tasks_map.get(r["group_id"]) != 'active':
+                tasks_map[r["group_id"]] = st
+        for r in c.execute("SELECT group_id, expires_at, expired FROM assigned_cards WHERE student_id=?", (student_id,)).fetchall():
+            active = (r["expired"] == 0) and (r["expires_at"] is None or r["expires_at"] > now)
+            st = 'active' if active else 'expired'
+            if cards_map.get(r["group_id"]) != 'active':
+                cards_map[r["group_id"]] = st
+    return web.json_response({"tasks": tasks_map, "cards": cards_map})
+
+async def api_homework_notify(request):
+    """Одно уведомление на всю отправку ДЗ (задания + карточки)."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    student_id = body.get("student_id")
+    has_tasks = body.get("has_tasks", False)
+    has_cards = body.get("has_cards", False)
     su = get_student_user(student_id)
-    if su and su.get("chat_id") and su.get("notif_cards", 1):
-        try:
-            await bot.send_message(su["chat_id"], "🖼 Появились новые карточки — загляни в приложение")
-        except Exception as e:
-            logging.warning("notify cards assign fail: %s", e)
+    if not su or not su.get("chat_id"):
+        return web.json_response({"ok": True})
+    try:
+        if has_tasks and has_cards:
+            # оба типа — два уведомления, каждое только если ученик включил этот тип
+            if su.get("notif_homework", 1):
+                await bot.send_message(su["chat_id"], rand_notif(_NOTIF_HOMEWORK), reply_markup=_open_app_kb())
+            if su.get("notif_cards", 1):
+                await bot.send_message(su["chat_id"], rand_notif(_NOTIF_CARDS), reply_markup=_open_app_kb())
+        elif has_tasks and su.get("notif_homework", 1):
+            await bot.send_message(su["chat_id"], rand_notif(_NOTIF_HOMEWORK), reply_markup=_open_app_kb())
+        elif has_cards and su.get("notif_cards", 1):
+            await bot.send_message(su["chat_id"], rand_notif(_NOTIF_CARDS), reply_markup=_open_app_kb())
+    except Exception as e:
+        logging.warning("homework_notify fail: %s", e)
     return web.json_response({"ok": True})
 
 async def api_student_next_lesson(request):
@@ -1009,7 +1124,8 @@ async def api_homework_progress(request):
         body.get("task_id"),
         body.get("assigned_id"),
         body.get("is_correct", False),
-        body.get("input_value", "")
+        body.get("input_value", ""),
+        body.get("done", False)
     )
     # проверяем завершена ли группа
     group_id = body.get("group_id")
@@ -1175,7 +1291,7 @@ async def api_broadcast(request):
                 c.commit()
             # в чат — только короткое уведомление, если включены «Новые посты»
             if su.get("notif_posts", 1) == 1:
-                await bot.send_message(su["chat_id"], "📭 Появился новый пост — загляни в приложение")
+                await bot.send_message(su["chat_id"], rand_notif(_NOTIF_POSTS), reply_markup=_open_app_kb())
             sent += 1
         except Exception as e:
             logging.warning("broadcast fail %s: %s", sid, e)
@@ -1296,9 +1412,13 @@ async def api_student_cards(request):
             return web.json_response({"groups": []})
         groups_rows = c.execute(
             """SELECT * FROM task_groups
-               WHERE level_id=? AND id IN (SELECT group_id FROM assigned_cards WHERE student_id=?)
+               WHERE level_id=? AND id IN (
+                 SELECT group_id FROM assigned_cards
+                 WHERE student_id=?
+                   AND (expires_at IS NULL OR expires_at > ?)
+               )
                ORDER BY sort""",
-            (cards_level["id"], student_id)
+            (cards_level["id"], student_id, int(datetime.now().timestamp()*1000))
         ).fetchall()
         viewed_rows = c.execute(
             "SELECT group_id FROM card_views WHERE student_id=?", (student_id,)
@@ -1383,7 +1503,15 @@ async def api_upload_photo(request):
 
 async def api_audio(request):
     """Возвращает прямую ссылку на аудио-файл по file_id."""
-    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    teacher = check_init(request)
+    student = check_init_student(request)
+    if teacher is None and student is None:
+        return web.json_response({"error":"auth"},status=403)
+    # если студент — проверяем что он подключён
+    if teacher is None:
+        su = get_student_by_chat(student)
+        if not su:
+            return web.json_response({"error":"not connected"},status=403)
     file_id=request.query.get("file_id","")
     if not file_id: return web.json_response({"error":"no file_id"},status=400)
     try:
@@ -1495,8 +1623,13 @@ async def notify_students_hour():
             student_tz = pytz.timezone(su.get("timezone", "Europe/Moscow"))
             lesson_dt = tz.localize(datetime.strptime(f"{date_str} {L['time']}", "%Y-%m-%d %H:%M"))
             student_time = lesson_dt.astimezone(student_tz).strftime("%H:%M")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть приложение",
+                                     web_app=WebAppInfo(url=STUDENT_URL))
+            ]])
             await bot.send_message(su["chat_id"],
-                f"⏰ Через час занятие по сербскому языку — в {student_time}!")
+                f"⏰ Через час занятие по сербскому языку — в {student_time}!",
+                reply_markup=kb)
         except Exception as e:
             logging.warning("student hour notify fail: %s", e)
 
@@ -1566,6 +1699,22 @@ async def handle_audio(m: Message):
         parse_mode="HTML"
     )
 
+@dp.message(Command("cleanup"))
+async def cmd_cleanup(m: Message):
+    if m.from_user.id != DEV_ID:
+        return
+    # /cleanup или /cleanup 30 — удалить назначения старше N дней после истечения
+    parts = (m.text or "").split()
+    days = 90
+    if len(parts) > 1:
+        try: days = max(1, int(parts[1]))
+        except Exception: pass
+    try:
+        t, c = cleanup_old_assignments(days)
+        await m.answer(f"🧹 Удалено старше {days} дней:\n• заданий: {t}\n• групп карточек: {c}")
+    except Exception as e:
+        await m.answer(f"Ошибка очистки: {e}")
+
 @dp.message(Command("backup"))
 async def cmd_backup(m: Message):
     if m.from_user.id != DEV_ID:
@@ -1607,11 +1756,16 @@ async def hour_reminder():
             if get_setting(marker, "0") == "1":
                 continue
             txt = f"⏰ Через час урок — {L.get('name') or 'занятие'} в {t}."
+            sep = "&" if "?" in MINIAPP_URL else "?"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть расписание",
+                                     web_app=WebAppInfo(url=f"{MINIAPP_URL}{sep}d={today}"))
+            ]])
             for chat_id in notify_users():
                 if get_setting(f"notify_hour_{chat_id}", "1") != "1":
                     continue
                 try:
-                    await bot.send_message(chat_id, txt)
+                    await bot.send_message(chat_id, txt, reply_markup=kb)
                 except Exception as e:
                     logging.warning("reminder fail %s: %s", chat_id, e)
             set_setting(marker, "1")
@@ -1676,7 +1830,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=25"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=26"
 
 async def on_startup(app):
     init_db()
@@ -1735,6 +1889,8 @@ def main():
     app.router.add_get("/api/audio",             api_audio)
     # домашние задания
     app.router.add_post("/api/homework/assign",  api_homework_assign)
+    app.router.add_get("/api/homework/assigned", api_homework_assigned)
+    app.router.add_post("/api/homework/notify",  api_homework_notify)
     app.router.add_get("/api/homework/student",  api_homework_student)
     app.router.add_get("/api/student/next_lesson", api_student_next_lesson)
     app.router.add_post("/api/homework/progress",api_homework_progress)
