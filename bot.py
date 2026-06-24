@@ -28,8 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=30"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=30"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=26"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=26"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -87,6 +87,29 @@ async def get_photo_file_id(photo_bytes, filename="img.jpg"):
     except Exception as e:
         logging.warning("get_photo_file_id fail: %s", e)
         return None
+
+async def get_audio_file_id(audio_bytes, filename="voice.ogg"):
+    """Загружает аудио в канал-хранилище и возвращает file_id."""
+    try:
+        msg = await bot.send_audio(
+            STORAGE_CHANNEL, BufferedInputFile(audio_bytes, filename=filename),
+            disable_notification=True
+        )
+        fid = msg.audio.file_id if msg.audio else None
+        if not fid and hasattr(msg, 'voice') and msg.voice:
+            fid = msg.voice.file_id
+        return fid
+    except Exception as e:
+        # пробуем как voice
+        try:
+            msg = await bot.send_voice(
+                STORAGE_CHANNEL, BufferedInputFile(audio_bytes, filename=filename),
+                disable_notification=True
+            )
+            return msg.voice.file_id if msg.voice else None
+        except Exception as e2:
+            logging.warning("get_audio_file_id fail: %s / %s", e, e2)
+            return None
 
 # ---------------------- DB ----------------------
 def db():
@@ -513,6 +536,12 @@ def get_dev_mode():
 def set_dev_mode(on: bool):
     set_setting("dev_mode", "1" if on else "0")
 
+def get_delete_mode():
+    return get_setting("delete_mode", "0") == "1"
+
+def set_delete_mode(on: bool):
+    set_setting("delete_mode", "1" if on else "0")
+
 def db_stats():
     with closing(db()) as c:
         students = c.execute("SELECT COUNT(*) FROM students WHERE archived=0").fetchone()[0]
@@ -858,16 +887,45 @@ async def api_history_set(request):
     return web.json_response({"ok": True, "history": get_history_mode()})
 
 async def api_dev_mode(request):
-    if check_init(request) is None:
-        return web.json_response({"error": "auth"}, status=403)
-    return web.json_response({"dev_mode": get_dev_mode()})
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    return web.json_response({"dev_mode": get_dev_mode(), "delete_mode": get_delete_mode()})
 
 async def api_dev_mode_set(request):
-    if check_init(request) is None:
-        return web.json_response({"error": "auth"}, status=403)
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
     body = await request.json()
     set_dev_mode(bool(body.get("on", False)))
     return web.json_response({"ok": True, "dev_mode": get_dev_mode()})
+
+async def api_delete_mode_set(request):
+    if check_init(request) is None: return web.json_response({"error":"auth"},status=403)
+    body = await request.json()
+    set_delete_mode(bool(body.get("on", False)))
+    return web.json_response({"ok": True, "delete_mode": get_delete_mode()})
+
+async def api_student_remove_assignment(request):
+    """Убрать назначение у ученика — как истёкший срок."""
+    uid = check_init_student(request)
+    if uid is None: return web.json_response({"error":"auth"},status=403)
+    if not get_delete_mode(): return web.json_response({"error":"delete_mode off"},status=403)
+    su = get_student_by_chat(uid)
+    if not su: return web.json_response({"error":"not connected"},status=403)
+    body = await request.json()
+    kind = body.get("kind")   # "task_group" | "card_group" | "message"
+    ref_id = body.get("id")
+    student_id = su["student_id"]
+    now = int(datetime.now().timestamp()*1000)
+    with closing(db()) as c:
+        if kind == "task_group":
+            c.execute("UPDATE assigned_tasks SET expires_at=? WHERE student_id=? AND group_id=?",
+                      (now-1, student_id, ref_id))
+        elif kind == "card_group":
+            c.execute("UPDATE assigned_cards SET expires_at=? WHERE student_id=? AND group_id=?",
+                      (now-1, student_id, ref_id))
+        elif kind == "message":
+            c.execute("UPDATE broadcast_messages SET expires_at=? WHERE id=? AND student_id=?",
+                      (now-1, ref_id, student_id))
+        c.commit()
+    return web.json_response({"ok": True})
 
 async def api_notify(request):
     """Возвращает персональные настройки уведомлений."""
@@ -1487,6 +1545,26 @@ async def api_card_view(request):
             c.commit()
     return web.json_response({"ok": True})
 
+async def api_upload_audio(request):
+    """Принимает base64 аудио (webm/ogg), загружает в канал-хранилище, возвращает file_id."""
+    if check_init(request) is None:
+        return web.json_response({"error": "auth"}, status=403)
+    body = await request.json()
+    audio_b64 = body.get("audio")
+    fmt = body.get("format", "ogg")  # webm или ogg
+    if not audio_b64:
+        return web.json_response({"error": "no audio"}, status=400)
+    try:
+        raw = base64.b64decode(audio_b64.split(",", 1)[-1])
+        filename = f"voice.{fmt}"
+        file_id = await get_audio_file_id(raw, filename)
+        if not file_id:
+            return web.json_response({"error": "upload failed"}, status=500)
+        return web.json_response({"ok": True, "audio_file_id": file_id})
+    except Exception as e:
+        logging.warning("upload_audio fail: %s", e)
+        return web.json_response({"error": str(e)}, status=500)
+
 async def api_upload_photo(request):
     """Принимает base64 фото, загружает в Telegram (себе, без показа в чате никому кроме DEV),
     возвращает photo_file_id для сохранения в карточке."""
@@ -1839,7 +1917,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=30"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=26"
 
 async def on_startup(app):
     init_db()
@@ -1879,8 +1957,11 @@ def main():
     app.router.add_post("/api/students/hide-from-stats",  api_hide_student_from_stats)
     app.router.add_get("/api/history",           api_history)
     app.router.add_post("/api/history/set",      api_history_set)
-    app.router.add_get("/api/dev_mode",          api_dev_mode)
-    app.router.add_post("/api/dev_mode/set",     api_dev_mode_set)
+    app.router.add_get("/api/dev_mode",              api_dev_mode)
+    app.router.add_post("/api/dev_mode/set",         api_dev_mode_set)
+    app.router.add_post("/api/delete_mode/set",      api_delete_mode_set)
+    app.router.add_post("/api/student/remove",       api_student_remove_assignment)
+    app.router.add_post("/api/upload_audio",         api_upload_audio)
     app.router.add_get("/api/notify",            api_notify)
     app.router.add_post("/api/notify/set",       api_notify_set)
     # конструктор заданий
