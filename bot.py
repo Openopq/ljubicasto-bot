@@ -903,11 +903,12 @@ async def api_delete_mode_set(request):
     return web.json_response({"ok": True, "delete_mode": get_delete_mode()})
 
 async def api_student_settings(request):
-  async def api_student_remove_assignment(request):
     """Публичные настройки для ученика — только delete_mode."""
     uid = check_init_student(request)
     if uid is None: return web.json_response({"error":"auth"},status=403)
     return web.json_response({"delete_mode": get_delete_mode()})
+
+async def api_student_remove_assignment(request):
     """Убрать назначение у ученика — как истёкший срок."""
     uid = check_init_student(request)
     if uid is None: return web.json_response({"error":"auth"},status=403)
@@ -1740,6 +1741,9 @@ async def notify_students_day():
             notified.add(sid)
         except Exception as e:
             logging.warning("student day notify fail: %s", e)
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(m: Message):
     if ALLOWED_IDS and m.from_user.id not in ALLOWED_IDS:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
