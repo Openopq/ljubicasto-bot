@@ -903,6 +903,7 @@ async def api_delete_mode_set(request):
     return web.json_response({"ok": True, "delete_mode": get_delete_mode()})
 
 async def api_student_settings(request):
+  async def api_student_remove_assignment(request):
     """Публичные настройки для ученика — только delete_mode."""
     uid = check_init_student(request)
     if uid is None: return web.json_response({"error":"auth"},status=403)
