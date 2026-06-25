@@ -28,8 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=36"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=36"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=37"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=37"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -1921,7 +1921,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=36"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=37"
 
 async def on_startup(app):
     init_db()
