@@ -28,8 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ======================= CONFIG =======================
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 STORAGE_CHANNEL = -1004417316297   # приватный канал-хранилище фото (бот — админ)
-MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=35"
-STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=35"
+MINIAPP_URL = "https://openopq.github.io/ljubicasto/?v=36"
+STUDENT_URL = "https://openopq.github.io/ljubicasto/student.html?v=36"
 ALLOWED_IDS = [7653945813, 6571313515]
 DEV_ID      = 7653945813          # только мне: бэкапы, статус, меню разработчика
 NOTIFY_HOUR = 8
@@ -902,7 +902,11 @@ async def api_delete_mode_set(request):
     set_delete_mode(bool(body.get("on", False)))
     return web.json_response({"ok": True, "delete_mode": get_delete_mode()})
 
-async def api_student_remove_assignment(request):
+async def api_student_settings(request):
+    """Публичные настройки для ученика — только delete_mode."""
+    uid = check_init_student(request)
+    if uid is None: return web.json_response({"error":"auth"},status=403)
+    return web.json_response({"delete_mode": get_delete_mode()})
     """Убрать назначение у ученика — как истёкший срок."""
     uid = check_init_student(request)
     if uid is None: return web.json_response({"error":"auth"},status=403)
@@ -1917,7 +1921,7 @@ async def auto_backup():
 PUBLIC_URL   = "https://bot-1781087941-4553-ruserb.bothost.tech"
 WEBHOOK_PATH = "/webhook"
 
-TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=35"
+TASKS_URL = "https://openopq.github.io/ljubicasto/tasks.html?v=36"
 
 async def on_startup(app):
     init_db()
@@ -1960,6 +1964,7 @@ def main():
     app.router.add_get("/api/dev_mode",              api_dev_mode)
     app.router.add_post("/api/dev_mode/set",         api_dev_mode_set)
     app.router.add_post("/api/delete_mode/set",      api_delete_mode_set)
+    app.router.add_get("/api/student/settings",      api_student_settings)
     app.router.add_post("/api/student/remove",       api_student_remove_assignment)
     app.router.add_post("/api/upload_audio",         api_upload_audio)
     app.router.add_get("/api/notify",            api_notify)
